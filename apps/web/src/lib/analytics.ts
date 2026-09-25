@@ -1,13 +1,14 @@
 import type { PostHog } from 'posthog-js'
 import {
   createReportableError,
+  durationBucket,
   type ReportableErrorContext,
   sanitizeCapture,
 } from './analytics-privacy'
+import { RESULT_SURVEY_ID } from './survey-config'
 
 const POSTHOG_KEY = 'phc_wVUY4kf7cB9GCtKztaQ4dk6ooYU8QaagC88breDYcgaj'
 const POSTHOG_HOST = 'https://us.i.posthog.com'
-const RESULT_SURVEY_ID = '01a0bb11-7aee-0000-29d8-a9f80fa33910'
 const RESULT_SURVEY_SHOWN_KEY = `bg0-survey-shown:${RESULT_SURVEY_ID}`
 
 type InputMethod = 'drop' | 'paste' | 'picker'
@@ -116,15 +117,17 @@ export function captureImageSelected(inputMethod: InputMethod) {
 export function captureRemovalSucceeded(
   inputMethod: InputMethod,
   provider: 'wasm' | 'webgpu',
+  durationMs: number,
 ) {
   capture('background_removal_succeeded', {
     input_method: inputMethod,
     provider,
+    duration_bucket: durationBucket(durationMs),
   })
 }
 
 export function showResultSurvey() {
-  if (resultSurveyPending) return
+  if (resultSurveyPending || !RESULT_SURVEY_ID) return
   try {
     if (window.localStorage.getItem(RESULT_SURVEY_SHOWN_KEY)) return
   } catch {

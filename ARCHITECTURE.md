@@ -44,9 +44,23 @@ metadata. BG0 may collect coarse product events such as a removal completing,
 but those events must not contain filenames, dimensions, sizes, URLs, pixels, or
 other information about the image.
 
-PostHog survey submissions are restricted in code to the result-quality rating
-choices and predefined failure reasons. Survey configuration must not add free
-text or response choices outside that allowlist. Exception reports use
+The removal success event includes a coarse duration bucket (`<5s`, `5-15s`,
+`15-30s`, `30-60s`, `>60s`) measured from choosing the image to the result. It
+does not report exact timings, which could hint at image size.
+
+PostHog survey answers are restricted in code to an allowlist of choices and
+0–10 scores. Answers outside it cause the whole survey event to be dropped, and
+this applies to sent, dismissed, and abandoned events. The only free text is
+the result survey's optional "Anything else we should know?" answer, which
+appears only after a poor rating. Before sending it, BG0 trims it, caps it at
+500 characters, and replaces email addresses, links, `blob:` and `data:` URIs,
+and long numbers such as phone numbers with placeholders. Text is accepted only
+under that question's ID in the survey set in
+`apps/web/src/lib/survey-config.ts`; text on any other answer drops the event.
+The "What was in the image?" question is a category the visitor picks. BG0
+never derives it from the image. The `$survey_questions` snapshot and other
+unrecognized `$survey_*` properties are removed. Survey configuration must not
+add open-text choices or questions outside this design. Exception reports use
 controlled error categories and only same-origin JavaScript source locations;
 arbitrary exception messages and stack text stay in the browser.
 
