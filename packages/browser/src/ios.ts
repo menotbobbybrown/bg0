@@ -41,14 +41,26 @@ function serialize<T>(
     queue = queue.then(async () => {
       waiting -= 1
       signal?.removeEventListener('abort', abort)
-      if (signal?.aborted) return
       try {
+        if (signal?.aborted) return
         resolve(await operation())
       } catch (error) {
         reject(error)
+      } finally {
+        retireIdleWorker()
       }
     })
   })
+}
+// A call that kept the worker for a queued photo cannot know whether that
+// photo will be cancelled or fail before inference, so the queue releases an
+// inference-sized heap once nothing is running or waiting. A preloaded worker
+// that has not run yet is kept.
+function retireIdleWorker() {
+  if (waiting > 0 || active || !cached?.hasRun) return
+  const idle = cached
+  cached = undefined
+  idle.dispose()
 }
 function cancelled(signal?: AbortSignal) {
   if (signal?.aborted)
@@ -281,6 +293,8 @@ export class IosWorker {
   >()
   private loaded?: Promise<void>
   private dead = false
+  /** True once an inference has grown the worker heap. */
+  hasRun = false
   private readonly loadIdleMs: number
   private readonly runMs: number
   onStage?: (stage: string, progress?: number) => void
@@ -312,13 +326,22 @@ export class IosWorker {
       if (data.error) request.reject(workerError(data.error))
       else request.resolve(data)
     }
-    this.worker.onerror = () =>
-      this.dispose(
-        new BackgroundRemovalError(
-          'model-load-failed',
-          'The local model stopped. Please try again.',
-        ),
+    this.worker.onerror = () => {
+      const running = [...this.pending.values()].some(
+        (request) => request.type === 'run',
       )
+      this.dispose(
+        running
+          ? new BackgroundRemovalError(
+              'inference-failed',
+              'Local processing stopped. Try again, or try a smaller image or a desktop browser.',
+            )
+          : new BackgroundRemovalError(
+              'model-load-failed',
+              'The local model stopped. Please try again.',
+            ),
+      )
+    }
     this.worker.onmessageerror = () =>
       this.dispose(new Error('Worker response unavailable'))
   }
@@ -331,6 +354,7 @@ export class IosWorker {
   }
   async run(pixels: Uint8ClampedArray): Promise<Float32Array> {
     const buffer = normalizeIosPixels(pixels, 512, 512).buffer as ArrayBuffer
+    this.hasRun = true
     const result = await this.request('run', buffer)
     if (!result.alpha || result.alpha.byteLength !== 512 * 512 * 4)
       throw new Error('Invalid mask shape')

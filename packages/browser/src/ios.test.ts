@@ -43,6 +43,13 @@ describe('iOS runtime lifetime', () => {
     await expect(result).rejects.toMatchObject({ code: 'model-load-failed' })
     expect(worker.terminated).toBe(true)
   })
+  test('worker death during inference is an inference failure', async () => {
+    const { worker, engine } = fakeWorker()
+    const result = engine.run(new Uint8ClampedArray(512 * 512 * 4))
+    worker.onerror?.()
+    await expect(result).rejects.toMatchObject({ code: 'inference-failed' })
+    expect(worker.terminated).toBe(true)
+  })
   test('disposal cancels pending inference and frees the worker', async () => {
     const { worker, sent, engine } = fakeWorker()
     const result = engine.run(new Uint8ClampedArray(512 * 512 * 4))
@@ -359,6 +366,26 @@ test('queued abort rejects before active inference finishes and does not start w
   }
   expect((await third).blob).toBe(png)
   expect(composite).toHaveBeenCalledTimes(2)
+})
+
+test('a cancelled queued photo still releases the kept worker', async () => {
+  const controller = new AbortController()
+  let disposedWhileFinishing: number | undefined
+  const first = removeBackground(png, {
+    onProgress: ({ stage }) => {
+      if (stage !== 'finishing' || disposedWhileFinishing !== undefined) return
+      // The first photo kept its worker because the second was waiting.
+      disposedWhileFinishing = disposed
+      controller.abort()
+    },
+  })
+  const second = removeBackground(png, { signal: controller.signal })
+  await expect(second).rejects.toMatchObject({ code: 'cancelled' })
+  await first
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  expect(disposedWhileFinishing).toBe(0)
+  expect(constructed).toBe(1)
+  expect(disposed).toBe(1)
 })
 
 test.each(['onerror', 'onmessageerror'] as const)(
