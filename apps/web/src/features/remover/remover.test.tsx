@@ -928,9 +928,14 @@ describe('Remover retry', () => {
         selectFile(view, new File(['x'], 'test.png', { type: 'image/png' }))
         await waitFor(() => {
           expect(
-            view.getByText('That image could not be processed'),
+            view.getByText(
+              code === 'image-too-large'
+                ? 'This image is too large'
+                : 'That image could not be processed',
+            ),
           ).toBeTruthy()
         })
+        expect(view.getAllByText(`${code} message`).length).toBe(2)
         if (shouldShowRetry) {
           expect(view.getByRole('button', { name: 'Try again' })).toBeTruthy()
         } else {

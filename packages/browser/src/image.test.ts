@@ -78,7 +78,18 @@ describe('validateImage', () => {
     const image = new Blob([new Uint8Array(MAX_IMAGE_BYTES + 1)], {
       type: 'image/jpeg',
     })
-    await expect(validateImage(image)).rejects.toThrow('over 40 MB')
+    await expect(validateImage(image)).rejects.toMatchObject({
+      code: 'image-too-large',
+      message:
+        'This file is 61 MB, and BG0 takes images up to 60 MB. Save it as a JPG or at a smaller size, then try again.',
+    })
+  })
+
+  test('accepts files between the old 40 MB and the new 60 MB limit', async () => {
+    const image = new Blob([new Uint8Array(50 * 1024 * 1024)], {
+      type: 'image/jpeg',
+    })
+    await expect(validateImage(image)).resolves.toBe('jpeg')
   })
 })
 
@@ -606,7 +617,12 @@ describe('prepareBoundedImage', () => {
                 ? null
                 : {
                     drawImage() {},
-                    getImageData: (_x: number, _y: number, w: number, h: number) => ({
+                    getImageData: (
+                      _x: number,
+                      _y: number,
+                      w: number,
+                      h: number,
+                    ) => ({
                       data: new Uint8ClampedArray(w * h * 4),
                     }),
                   },
@@ -618,10 +634,17 @@ describe('prepareBoundedImage', () => {
     })
     Object.defineProperty(globalThis, 'createImageBitmap', {
       configurable: true,
-      value: async (_image: ImageBitmap, resize: { resizeWidth: number; resizeHeight: number }) => {
+      value: async (
+        _image: ImageBitmap,
+        resize: { resizeWidth: number; resizeHeight: number },
+      ) => {
         resizes.push(resize)
         if (options.failResize) throw new Error('resize failed')
-        return { width: resize.resizeWidth, height: resize.resizeHeight, close() {} }
+        return {
+          width: resize.resizeWidth,
+          height: resize.resizeHeight,
+          close() {},
+        }
       },
     })
     try {
@@ -641,7 +664,14 @@ describe('prepareBoundedImage', () => {
         (value) => ({ value }),
         (error: unknown) => ({ error }),
       )
-      return { result, canvases, resizes, decodes: () => decodes, closed: () => closed, source }
+      return {
+        result,
+        canvases,
+        resizes,
+        decodes: () => decodes,
+        closed: () => closed,
+        source,
+      }
     } finally {
       for (const [name, descriptor] of [
         ['document', originalDocument],
@@ -666,7 +696,9 @@ describe('prepareBoundedImage', () => {
     ])
     // The full-resolution bitmap and the 512px canvas are both released.
     expect(run.closed()).toBe(1)
-    expect(run.canvases.every((c) => c.width === 0 && c.height === 0)).toBe(true)
+    expect(run.canvases.every((c) => c.width === 0 && c.height === 0)).toBe(
+      true,
+    )
   })
 
   test('reuses a small photo instead of upscaling or copying it', async () => {
@@ -684,7 +716,9 @@ describe('prepareBoundedImage', () => {
     const run = await prepare(8000, 6000, options)
     expect('error' in run.result).toBe(true)
     expect(run.closed()).toBe(1)
-    expect(run.canvases.every((c) => c.width === 0 && c.height === 0)).toBe(true)
+    expect(run.canvases.every((c) => c.width === 0 && c.height === 0)).toBe(
+      true,
+    )
   })
 })
 

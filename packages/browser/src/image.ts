@@ -1,6 +1,6 @@
 import { BackgroundRemovalError } from './errors'
 
-export const MAX_IMAGE_BYTES = 40 * 1024 * 1024
+export const MAX_IMAGE_BYTES = 60 * 1024 * 1024
 export const SUPPORTED_IMAGE_MIME_TYPES = [
   'image/png',
   'image/jpeg',
@@ -64,7 +64,7 @@ export async function validateImage(
   if (input.size > MAX_IMAGE_BYTES) {
     throw new BackgroundRemovalError(
       'image-too-large',
-      'This image is over 40 MB. Choose a smaller file.',
+      `This file is ${Math.ceil(input.size / (1024 * 1024))} MB, and BG0 takes images up to 60 MB. Save it as a JPG or at a smaller size, then try again.`,
     )
   }
 

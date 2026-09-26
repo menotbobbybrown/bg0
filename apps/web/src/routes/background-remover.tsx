@@ -16,7 +16,7 @@ function BackgroundRemoverPage() {
       title="Free background remover"
       intro="Remove the background from a photo and download a transparent PNG. BG0 processes your image on your device, with no account, credits, or subscription."
       steps={[
-        "Open the remover and choose or drop an image. PNG, JPG, WebP, HEIC, and HEIF files up to 40 MB are supported.",
+        "Open the remover and choose or drop an image. PNG, JPG, WebP, HEIC, and HEIF files up to 60 MB are supported.",
         "Keep the page open while BG0 prepares the model and processes your image. The first use needs an internet connection to download the model.",
         "Inspect the result, then select Download PNG. Choose another image when you are ready to repeat the process.",
       ]}
