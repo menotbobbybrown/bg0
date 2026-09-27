@@ -4,8 +4,14 @@ import type { RemovalProgress } from '@bg0/browser'
 // page, so no failure event is ever sent. A marker in sessionStorage survives
 // that reload and lets the next page load explain what happened.
 //
-// Privacy: the marker holds only the stage, the provider, and the start
-// time. Never add image data, filenames, dimensions, or URLs.
+// Browsers copy sessionStorage into tabs opened from this one and into
+// duplicated tabs, so a marker alone can belong to a run that is still going
+// in another tab. Each run therefore holds a Web Lock named after the marker's
+// random id. Locks are released when a page dies, so a marker whose lock is
+// still held belongs to a live run and is left alone.
+//
+// Privacy: the marker holds only the stage, the provider, the start time, and
+// a random id. Never add image data, filenames, dimensions, or URLs.
 export const RUN_MARKER_KEY = 'bg0:active-removal'
 // A marker older than this is from an earlier visit, not this reload.
 export const RUN_MARKER_MAX_AGE_MS = 10 * 60_000
@@ -20,7 +26,12 @@ interface RunMarker {
   stage: RunStage
   provider: RunProvider
   startedAt: number
+  // Missing on markers written before run locks existed.
+  id?: string
 }
+
+/** The part of the Web Locks API the marker uses. */
+export type RunLocks = Pick<LockManager, 'request' | 'query'>
 
 const STAGES: readonly RunStage[] = [
   'preparing',
@@ -30,13 +41,31 @@ const STAGES: readonly RunStage[] = [
 ]
 const PROVIDERS: readonly RunProvider[] = ['wasm', 'webgpu', 'unknown']
 
-let lastStartedAt = 0
+export function runLockName(id: string) {
+  return `${RUN_MARKER_KEY}:${id}`
+}
 
 function sessionStore(): Storage | undefined {
   try {
     return window.sessionStorage
   } catch {
     return undefined
+  }
+}
+
+function webLocks(): RunLocks | undefined {
+  try {
+    return globalThis.navigator?.locks ?? undefined
+  } catch {
+    return undefined
+  }
+}
+
+function randomId() {
+  try {
+    return crypto.randomUUID()
+  } catch {
+    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
   }
 }
 
@@ -48,20 +77,22 @@ function read(storage: Storage | undefined): RunMarker | undefined {
     if (
       !STAGES.includes(value.stage as RunStage) ||
       !PROVIDERS.includes(value.provider as RunProvider) ||
-      typeof value.startedAt !== 'number'
+      typeof value.startedAt !== 'number' ||
+      (value.id !== undefined && typeof value.id !== 'string')
     )
       return undefined
     return {
       stage: value.stage as RunStage,
       provider: value.provider as RunProvider,
       startedAt: value.startedAt,
+      id: value.id,
     }
   } catch {
     return undefined
   }
 }
 
-function write(storage: Storage | undefined, marker: RunMarker) {
+function write(storage: Storage | undefined, marker: Required<RunMarker>) {
   try {
     storage?.setItem(
       RUN_MARKER_KEY,
@@ -69,11 +100,16 @@ function write(storage: Storage | undefined, marker: RunMarker) {
         stage: marker.stage,
         provider: marker.provider,
         startedAt: marker.startedAt,
+        id: marker.id,
       }),
     )
   } catch {
     // Storage can be full or disabled. Losing the marker only loses the notice.
   }
+}
+
+function sameMarker(a: RunMarker | undefined, b: RunMarker) {
+  return a?.id === b.id && a?.startedAt === b.startedAt
 }
 
 export interface RunMarkerHandle {
@@ -85,25 +121,37 @@ export interface RunMarkerHandle {
 export function startRunMarker(
   storage = sessionStore(),
   now = Date.now(),
+  locks = webLocks(),
 ): RunMarkerHandle {
-  // startedAt doubles as the run's identity, so keep it unique within the tab.
-  const startedAt = Math.max(now, lastStartedAt + 1)
-  lastStartedAt = startedAt
+  const id = randomId()
+  const startedAt = now
   let stage: RunStage = 'preparing'
   let provider: RunProvider = 'unknown'
   let active = true
-  write(storage, { stage, provider, startedAt })
-  const owned = () => read(storage)?.startedAt === startedAt
+  let release = () => {}
+  if (locks) {
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    try {
+      locks.request(runLockName(id), () => held).catch(() => {})
+    } catch {
+      // Without the lock, other tabs fall back to reporting a copied marker.
+    }
+  }
+  write(storage, { stage, provider, startedAt, id })
+  const owned = () => read(storage)?.id === id
   return {
     update(next, nextProvider = provider) {
       if (!active || (next === stage && nextProvider === provider)) return
       stage = next
       provider = nextProvider
-      if (owned()) write(storage, { stage, provider, startedAt })
+      if (owned()) write(storage, { stage, provider, startedAt, id })
     },
     clear() {
       if (!active) return
       active = false
+      release()
       try {
         if (owned()) storage?.removeItem(RUN_MARKER_KEY)
       } catch {
@@ -122,19 +170,39 @@ export function clearRunMarker(storage = sessionStore()) {
   }
 }
 
+async function runIsAlive(locks: RunLocks | undefined, id: string | undefined) {
+  if (!locks || !id) return false
+  try {
+    const name = runLockName(id)
+    const { held = [], pending = [] } = await locks.query()
+    return [...held, ...pending].some((lock) => lock.name === name)
+  } catch {
+    return false
+  }
+}
+
 /**
  * Return and remove a marker left by a page that died mid-run. Call this once
- * when the remover mounts, before any new run can write its own marker.
+ * when the remover mounts. A marker whose run still holds its lock in another
+ * tab is kept and not reported. Missing or stale markers are dropped before
+ * the returned promise first yields.
  */
-export function takeInterruptedRun(
+export async function takeInterruptedRun(
   storage = sessionStore(),
   now = Date.now(),
-): { stage: RunStage; provider: RunProvider } | undefined {
+  locks = webLocks(),
+): Promise<{ stage: RunStage; provider: RunProvider } | undefined> {
   const marker = read(storage)
+  const age = marker ? now - marker.startedAt : -1
+  if (!marker || age < 0 || age > RUN_MARKER_MAX_AGE_MS) {
+    clearRunMarker(storage)
+    return undefined
+  }
+  if (await runIsAlive(locks, marker.id)) return undefined
+  // A new run in this tab, or another call, may have replaced or taken the
+  // marker while the lock query was pending.
+  if (!sameMarker(read(storage), marker)) return undefined
   clearRunMarker(storage)
-  if (!marker) return undefined
-  const age = now - marker.startedAt
-  if (age < 0 || age > RUN_MARKER_MAX_AGE_MS) return undefined
   return { stage: marker.stage, provider: marker.provider }
 }
 

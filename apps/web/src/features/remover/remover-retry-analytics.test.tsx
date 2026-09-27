@@ -206,26 +206,24 @@ describe('Remover interrupted runs', () => {
     return raw ? (JSON.parse(raw) as Record<string, unknown>) : null
   }
 
-  test('a run records only stage, provider, and time, then clears on success', async () => {
+  test('a run records only stage, provider, time, and a random id, then clears on success', async () => {
     let finish!: (result: BackgroundRemovalResult) => void
     let report!: (
       stage: 'preparing' | 'processing',
       provider?: 'webgpu' | 'wasm',
     ) => void
-    const remove = mock(
-      (_input: Blob, options?: RemoveBackgroundOptions) => {
-        report = (stage, provider) =>
-          options?.onProgress?.({
-            stage,
-            progress: 0.7,
-            message: 'x',
-            provider,
-          })
-        return new Promise<BackgroundRemovalResult>((resolve) => {
-          finish = resolve
+    const remove = mock((_input: Blob, options?: RemoveBackgroundOptions) => {
+      report = (stage, provider) =>
+        options?.onProgress?.({
+          stage,
+          progress: 0.7,
+          message: 'x',
+          provider,
         })
-      },
-    )
+      return new Promise<BackgroundRemovalResult>((resolve) => {
+        finish = resolve
+      })
+    })
     const view = render(
       <Remover
         removeBackgroundImpl={remove}
@@ -247,6 +245,7 @@ describe('Remover interrupted runs', () => {
       report('processing', 'wasm')
       const marker = readMarker()
       expect(Object.keys(marker ?? {}).sort()).toEqual([
+        'id',
         'provider',
         'stage',
         'startedAt',
@@ -322,6 +321,57 @@ describe('Remover interrupted runs', () => {
     const again = render(<Remover waitForPaintImpl={async () => {}} />)
     again.unmount()
     expect(interruptedCalls).toHaveLength(1)
+  })
+
+  test('a run still holding its lock in another tab is not reported', async () => {
+    const raw = JSON.stringify({
+      stage: 'processing',
+      provider: 'wasm',
+      startedAt: Date.now() - 20_000,
+      id: 'other-tab',
+    })
+    let held = ['bg0:active-removal:other-tab']
+    let queries = 0
+    const original = Object.getOwnPropertyDescriptor(navigator, 'locks')
+    Object.defineProperty(navigator, 'locks', {
+      configurable: true,
+      value: {
+        request: () => Promise.resolve(),
+        query: async () => {
+          queries++
+          return {
+            held: held.map((name) => ({ name, mode: 'exclusive' })),
+            pending: [],
+          }
+        },
+      },
+    })
+    try {
+      // This tab was duplicated while the other one was still processing.
+      sessionStorage.setItem(KEY, raw)
+      const view = render(<Remover waitForPaintImpl={async () => {}} />)
+      await waitFor(() => expect(queries).toBe(1))
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      expect(interruptedCalls).toEqual([])
+      expect(view.queryByText(/ran out of memory/)).toBeNull()
+      expect(sessionStorage.getItem(KEY)).toBe(raw)
+      view.unmount()
+
+      // Once that tab dies, its lock is gone and the marker is reported.
+      held = []
+      const again = render(<Remover waitForPaintImpl={async () => {}} />)
+      await waitFor(() =>
+        expect(interruptedCalls).toEqual([['processing', 'wasm']]),
+      )
+      expect(again.getByRole('status').textContent).toContain(
+        'the browser ran out of memory',
+      )
+      expect(readMarker()).toBeNull()
+      again.unmount()
+    } finally {
+      if (original) Object.defineProperty(navigator, 'locks', original)
+      else delete (navigator as { locks?: unknown }).locks
+    }
   })
 
   test('an old marker from an earlier visit is dropped silently', () => {

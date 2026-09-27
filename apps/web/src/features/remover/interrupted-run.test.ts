@@ -4,6 +4,8 @@ import {
   createStallGuard,
   RUN_MARKER_KEY,
   RUN_MARKER_MAX_AGE_MS,
+  type RunLocks,
+  runLockName,
   startRunMarker,
   takeInterruptedRun,
 } from './interrupted-run'
@@ -26,19 +28,44 @@ function memoryStorage(): Storage {
   }
 }
 
+// A lock manager shared by every "tab" in a test. Locks are exclusive and
+// never contended here because every run uses a unique name.
+function fakeLocks() {
+  const held = new Map<string, Promise<unknown>>()
+  const locks = {
+    request: ((name: string, callback: (lock: Lock) => Promise<unknown>) => {
+      const done = Promise.resolve(callback({ name, mode: 'exclusive' }))
+      held.set(name, done)
+      return done.finally(() => {
+        if (held.get(name) === done) held.delete(name)
+      })
+    }) as unknown as LockManager['request'],
+    query: async () => ({
+      held: [...held.keys()].map((name) => ({
+        name,
+        mode: 'exclusive' as const,
+        clientId: 'tab',
+      })),
+      pending: [],
+    }),
+  } satisfies RunLocks
+  return { locks, held }
+}
+
+const settle = () => new Promise((resolve) => setTimeout(resolve, 0))
+
 describe('interrupted run marker', () => {
-  test('stores only stage, provider, and start time', () => {
+  test('stores only stage, provider, start time, and a random id', () => {
     const storage = memoryStorage()
     const run = startRunMarker(storage, 1000)
     run.update('processing', 'webgpu')
     const marker = JSON.parse(storage.getItem(RUN_MARKER_KEY) ?? '')
-    // Earlier runs in this process can push startedAt past the given time.
     expect(marker).toEqual({
       stage: 'processing',
       provider: 'webgpu',
-      startedAt: expect.any(Number),
+      startedAt: 1000,
+      id: expect.any(String),
     })
-    expect(marker.startedAt).toBeGreaterThanOrEqual(1000)
     run.clear()
     expect(storage.getItem(RUN_MARKER_KEY)).toBeNull()
   })
@@ -56,23 +83,101 @@ describe('interrupted run marker', () => {
     expect(storage.getItem(RUN_MARKER_KEY)).toBeNull()
   })
 
-  test('a fresh marker is reported once', () => {
+  test('a fresh marker is reported once', async () => {
     const storage = memoryStorage()
     startRunMarker(storage, 5000).update('downloading', 'wasm')
-    const { startedAt } = JSON.parse(storage.getItem(RUN_MARKER_KEY) ?? '')
-    expect(takeInterruptedRun(storage, startedAt + 20_000)).toEqual({
+    expect(await takeInterruptedRun(storage, 25_000)).toEqual({
       stage: 'downloading',
       provider: 'wasm',
     })
-    expect(takeInterruptedRun(storage, startedAt + 20_000)).toBeUndefined()
+    expect(await takeInterruptedRun(storage, 25_000)).toBeUndefined()
   })
 
-  test('the provider stays unknown until the run reports it', () => {
+  test('a marker from before run ids is still reported', async () => {
+    const storage = memoryStorage()
+    storage.setItem(
+      RUN_MARKER_KEY,
+      JSON.stringify({ stage: 'processing', provider: 'wasm', startedAt: 1 }),
+    )
+    const { locks } = fakeLocks()
+    expect(await takeInterruptedRun(storage, 2, locks)).toEqual({
+      stage: 'processing',
+      provider: 'wasm',
+    })
+  })
+
+  test('a run whose lock is held in another tab is not reported or removed', async () => {
+    const { locks, held } = fakeLocks()
+    const original = memoryStorage()
+    const run = startRunMarker(original, 8000, locks)
+    run.update('processing', 'wasm')
+    const raw = original.getItem(RUN_MARKER_KEY) ?? ''
+    const { id } = JSON.parse(raw)
+    expect(held.has(runLockName(id))).toBe(true)
+    // A duplicated or opened tab starts with a copy of sessionStorage.
+    const copy = memoryStorage()
+    copy.setItem(RUN_MARKER_KEY, raw)
+    expect(await takeInterruptedRun(copy, 9000, locks)).toBeUndefined()
+    expect(copy.getItem(RUN_MARKER_KEY)).toBe(raw)
+    run.clear()
+    await settle()
+    expect(held.size).toBe(0)
+    expect(original.getItem(RUN_MARKER_KEY)).toBeNull()
+  })
+
+  test('a run whose lock is no longer held is reported', async () => {
+    const { locks, held } = fakeLocks()
+    const storage = memoryStorage()
+    startRunMarker(storage, 8000, locks).update('processing', 'webgpu')
+    // The page died, which releases every lock it held.
+    held.clear()
+    expect(await takeInterruptedRun(storage, 9000, locks)).toEqual({
+      stage: 'processing',
+      provider: 'webgpu',
+    })
+    expect(storage.getItem(RUN_MARKER_KEY)).toBeNull()
+  })
+
+  test('a failing lock query falls back to reporting', async () => {
+    const storage = memoryStorage()
+    startRunMarker(storage, 8000).update('finishing', 'wasm')
+    const locks = {
+      request: (() =>
+        Promise.reject(new Error('x'))) as unknown as LockManager['request'],
+      query: () => Promise.reject(new Error('denied')),
+    } satisfies RunLocks
+    expect(await takeInterruptedRun(storage, 9000, locks)).toEqual({
+      stage: 'finishing',
+      provider: 'wasm',
+    })
+  })
+
+  test('a marker replaced during the lock query is left for its new run', async () => {
+    const { locks } = fakeLocks()
+    const storage = memoryStorage()
+    storage.setItem(
+      RUN_MARKER_KEY,
+      JSON.stringify({
+        stage: 'processing',
+        provider: 'wasm',
+        startedAt: 1,
+        id: 'dead',
+      }),
+    )
+    const pending = takeInterruptedRun(storage, 2, locks)
+    const run = startRunMarker(storage, 3, locks)
+    expect(await pending).toBeUndefined()
+    expect(JSON.parse(storage.getItem(RUN_MARKER_KEY) ?? '')).toMatchObject({
+      stage: 'preparing',
+    })
+    run.clear()
+  })
+
+  test('the provider stays unknown until the run reports it', async () => {
     const storage = memoryStorage()
     const run = startRunMarker(storage, 6000)
     run.update('downloading')
-    const { startedAt } = JSON.parse(storage.getItem(RUN_MARKER_KEY) ?? '')
-    expect(takeInterruptedRun(storage, startedAt)).toEqual({
+    expect(await takeInterruptedRun(storage, 6000)).toEqual({
       stage: 'downloading',
       provider: 'unknown',
     })
@@ -88,18 +193,38 @@ describe('interrupted run marker', () => {
   })
 
   test.each([
-    ['stale', JSON.stringify({ stage: 'processing', provider: 'wasm', startedAt: 0 })],
+    [
+      'stale',
+      JSON.stringify({ stage: 'processing', provider: 'wasm', startedAt: 0 }),
+    ],
     ['malformed', '{not json'],
-    ['unknown stage', JSON.stringify({ stage: 'x', provider: 'wasm', startedAt: 1 })],
-    ['unknown provider', JSON.stringify({ stage: 'processing', provider: 'x', startedAt: 1 })],
-  ])('a %s marker is dropped without a report', (_, raw) => {
+    [
+      'unknown stage',
+      JSON.stringify({ stage: 'x', provider: 'wasm', startedAt: 1 }),
+    ],
+    [
+      'unknown provider',
+      JSON.stringify({ stage: 'processing', provider: 'x', startedAt: 1 }),
+    ],
+    [
+      'non-string id',
+      JSON.stringify({
+        stage: 'processing',
+        provider: 'wasm',
+        startedAt: 1,
+        id: 4,
+      }),
+    ],
+  ])('a %s marker is dropped without a report', async (_, raw) => {
     const storage = memoryStorage()
     storage.setItem(RUN_MARKER_KEY, raw)
-    expect(takeInterruptedRun(storage, RUN_MARKER_MAX_AGE_MS + 1)).toBeUndefined()
+    const taken = takeInterruptedRun(storage, RUN_MARKER_MAX_AGE_MS + 1)
+    // Dropped before the first await, so a mount sees a clean slate at once.
     expect(storage.getItem(RUN_MARKER_KEY)).toBeNull()
+    expect(await taken).toBeUndefined()
   })
 
-  test('unavailable storage never breaks processing', () => {
+  test('unavailable storage never breaks processing', async () => {
     const broken = {
       getItem() {
         throw new Error('denied')
@@ -114,7 +239,7 @@ describe('interrupted run marker', () => {
     const run = startRunMarker(broken)
     expect(() => run.update('processing')).not.toThrow()
     expect(() => run.clear()).not.toThrow()
-    expect(takeInterruptedRun(broken)).toBeUndefined()
+    expect(await takeInterruptedRun(broken)).toBeUndefined()
   })
 })
 

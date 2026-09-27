@@ -4,8 +4,8 @@ import {
   type BackgroundRemovalResult,
   IMAGE_ACCEPT_ATTRIBUTE,
   isIosBrowser,
-  type RemovalProgress,
   prepareBackgroundRemoval,
+  type RemovalProgress,
   removeBackground,
   SUPPORTED_IMAGE_FORMAT_LABEL,
   SUPPORTED_IMAGE_MIME_TYPES,
@@ -235,12 +235,16 @@ export function Remover({
   }, [])
 
   useEffect(() => {
-    const previous = takeInterruptedRun()
-    if (previous) {
+    // The check waits on a Web Lock query. The event is reported even if the
+    // remover unmounts first, but the notice is shown only on a mounted, idle
+    // remover so it never covers a run the user has already started.
+    void takeInterruptedRun().then((previous) => {
+      if (!previous) return
       captureRemovalInterrupted(previous.stage, previous.provider)
+      if (!mounted.current || latestState.current.status !== 'idle') return
       setInterrupted(true)
       setAnnouncement(INTERRUPTED_RUN_MESSAGE)
-    }
+    })
     // Leaving or reloading the page on purpose is not an interruption.
     const leave = () => runMarker.current?.clear()
     window.addEventListener('pagehide', leave)
