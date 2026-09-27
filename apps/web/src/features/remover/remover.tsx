@@ -431,11 +431,16 @@ export function Remover({
         navigator.clipboard.write([new ClipboardItem({ 'image/png': png })]),
         CLIPBOARD_TIMEOUT_MS,
       )
-      setCopied(true)
-      setResultSaved(true)
+      // A new image may have replaced this result while the write was
+      // pending. The clipboard holds the old PNG, so the new one stays unsaved.
+      const shown = latestState.current
+      if (shown.status === 'result' && shown.resultUrl === current.resultUrl) {
+        setCopied(true)
+        setResultSaved(true)
+        window.setTimeout(() => setCopied(false), 1600)
+      }
       notify('PNG copied to the clipboard')
       captureFeatureUsed('copy_result')
-      window.setTimeout(() => setCopied(false), 1600)
     } catch {
       notify('Clipboard blocked by the browser. Download instead.', 'error')
     }
