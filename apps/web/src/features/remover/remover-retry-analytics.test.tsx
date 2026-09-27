@@ -141,4 +141,37 @@ describe('Remover retry analytics', () => {
       view.unmount()
     }
   })
+
+  test('drops and pastes on the result screen report their input method', async () => {
+    const remove = mock(() => Promise.resolve(resultWithSource()))
+    const view = render(
+      <Remover
+        removeBackgroundImpl={remove}
+        waitForPaintImpl={async () => {}}
+      />,
+    )
+
+    try {
+      selectFile(view, new File(['one'], 'one.png', { type: 'image/png' }))
+      await waitFor(() => {
+        expect(view.getByRole('button', { name: /Download PNG/ })).toBeTruthy()
+      })
+
+      const dropped = new DataTransfer()
+      dropped.items.add(new File(['two'], 'two.png', { type: 'image/png' }))
+      fireEvent.drop(window, { dataTransfer: dropped })
+      await waitFor(() => expect(remove).toHaveBeenCalledTimes(2))
+      await waitFor(() => {
+        expect(view.getByRole('button', { name: /Download PNG/ })).toBeTruthy()
+      })
+
+      const pasted = new DataTransfer()
+      pasted.items.add(new File(['three'], 'clip.png', { type: 'image/png' }))
+      fireEvent.paste(window, { clipboardData: pasted })
+      await waitFor(() => expect(remove).toHaveBeenCalledTimes(3))
+      expect(imageSelectedCalls).toEqual(['picker', 'drop', 'paste'])
+    } finally {
+      view.unmount()
+    }
+  })
 })
