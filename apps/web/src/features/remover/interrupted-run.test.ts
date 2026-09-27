@@ -31,11 +31,14 @@ describe('interrupted run marker', () => {
     const storage = memoryStorage()
     const run = startRunMarker('webgpu', storage, 1000)
     run.update('processing')
-    expect(JSON.parse(storage.getItem(RUN_MARKER_KEY) ?? '')).toEqual({
+    const marker = JSON.parse(storage.getItem(RUN_MARKER_KEY) ?? '')
+    // Earlier runs in this process can push startedAt past the given time.
+    expect(marker).toEqual({
       stage: 'processing',
       provider: 'webgpu',
-      startedAt: 1000,
+      startedAt: expect.any(Number),
     })
+    expect(marker.startedAt).toBeGreaterThanOrEqual(1000)
     run.clear()
     expect(storage.getItem(RUN_MARKER_KEY)).toBeNull()
   })
@@ -56,11 +59,12 @@ describe('interrupted run marker', () => {
   test('a fresh marker is reported once', () => {
     const storage = memoryStorage()
     startRunMarker('wasm', storage, 5000).update('downloading')
-    expect(takeInterruptedRun(storage, 25_000)).toEqual({
+    const { startedAt } = JSON.parse(storage.getItem(RUN_MARKER_KEY) ?? '')
+    expect(takeInterruptedRun(storage, startedAt + 20_000)).toEqual({
       stage: 'downloading',
       provider: 'wasm',
     })
-    expect(takeInterruptedRun(storage, 25_000)).toBeUndefined()
+    expect(takeInterruptedRun(storage, startedAt + 20_000)).toBeUndefined()
   })
 
   test.each([
