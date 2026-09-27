@@ -121,14 +121,18 @@ never shrinks. The next photo starts a new worker from the HTTP-cached files.
 The model streams into one buffer of its known size. Worker requests have a
 watchdog (load: no progress for 90 s; inference: 120 s) that terminates the
 worker and returns a retryable error, and allocation failures are reported as
-out-of-memory. Abort terminates the worker and settles pending requests. Cache reset defers retirement until active work ends.
+out-of-memory. Abort terminates the worker and settles pending requests. Decode
+and PNG encode run outside the worker, so abort abandons them instead: the call
+settles at once so a retry is not queued behind a hung stage, and a late bitmap
+is closed when it arrives. Cache reset defers retirement until active work ends.
 Buffers are transferred rather than cloned. Model-load failures are retryable;
 no fallback to the known memory-heavy iPhone model is attempted. The worker does
 not bypass Safari's per-tab memory budget.
 
 When Safari exceeds that budget it kills the page and reloads it, so no failure
 event can be sent. The remover keeps a sessionStorage marker during each run
-that holds only the stage, the expected provider, and the start time. A marker
+that holds only the stage, the provider, and the start time. The provider is
+`unknown` until `@bg0/browser` reports the one it chose in a progress event. A marker
 found on the next load within 10 minutes produces one anonymous
 `background_removal_interrupted` event with only `stage` and `provider`, and an
 explanation for the user. Success, failure, cancel, reset, unmount, and

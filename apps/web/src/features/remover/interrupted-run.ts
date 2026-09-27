@@ -4,8 +4,8 @@ import type { RemovalProgress } from '@bg0/browser'
 // page, so no failure event is ever sent. A marker in sessionStorage survives
 // that reload and lets the next page load explain what happened.
 //
-// Privacy: the marker holds only the stage, the expected provider, and the
-// start time. Never add image data, filenames, dimensions, or URLs.
+// Privacy: the marker holds only the stage, the provider, and the start
+// time. Never add image data, filenames, dimensions, or URLs.
 export const RUN_MARKER_KEY = 'bg0:active-removal'
 // A marker older than this is from an earlier visit, not this reload.
 export const RUN_MARKER_MAX_AGE_MS = 10 * 60_000
@@ -13,7 +13,8 @@ export const RUN_MARKER_MAX_AGE_MS = 10 * 60_000
 export const RUN_STALL_MS = 5 * 60_000
 
 export type RunStage = RemovalProgress['stage']
-export type RunProvider = 'wasm' | 'webgpu'
+// 'unknown' until the browser package reports the provider it actually chose.
+export type RunProvider = 'wasm' | 'webgpu' | 'unknown'
 
 interface RunMarker {
   stage: RunStage
@@ -27,6 +28,7 @@ const STAGES: readonly RunStage[] = [
   'processing',
   'finishing',
 ]
+const PROVIDERS: readonly RunProvider[] = ['wasm', 'webgpu', 'unknown']
 
 let lastStartedAt = 0
 
@@ -45,13 +47,13 @@ function read(storage: Storage | undefined): RunMarker | undefined {
     const value = JSON.parse(raw) as Partial<RunMarker>
     if (
       !STAGES.includes(value.stage as RunStage) ||
-      (value.provider !== 'wasm' && value.provider !== 'webgpu') ||
+      !PROVIDERS.includes(value.provider as RunProvider) ||
       typeof value.startedAt !== 'number'
     )
       return undefined
     return {
       stage: value.stage as RunStage,
-      provider: value.provider,
+      provider: value.provider as RunProvider,
       startedAt: value.startedAt,
     }
   } catch {
@@ -75,13 +77,12 @@ function write(storage: Storage | undefined, marker: RunMarker) {
 }
 
 export interface RunMarkerHandle {
-  update(stage: RunStage): void
+  update(stage: RunStage, provider?: RunProvider): void
   clear(): void
 }
 
 /** Record that a removal is in progress. Clearing only removes this run's marker. */
 export function startRunMarker(
-  provider: RunProvider,
   storage = sessionStore(),
   now = Date.now(),
 ): RunMarkerHandle {
@@ -89,13 +90,15 @@ export function startRunMarker(
   const startedAt = Math.max(now, lastStartedAt + 1)
   lastStartedAt = startedAt
   let stage: RunStage = 'preparing'
+  let provider: RunProvider = 'unknown'
   let active = true
   write(storage, { stage, provider, startedAt })
   const owned = () => read(storage)?.startedAt === startedAt
   return {
-    update(next) {
-      if (!active || next === stage) return
+    update(next, nextProvider = provider) {
+      if (!active || (next === stage && nextProvider === provider)) return
       stage = next
+      provider = nextProvider
       if (owned()) write(storage, { stage, provider, startedAt })
     },
     clear() {

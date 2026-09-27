@@ -208,11 +208,19 @@ describe('Remover interrupted runs', () => {
 
   test('a run records only stage, provider, and time, then clears on success', async () => {
     let finish!: (result: BackgroundRemovalResult) => void
-    let report!: (stage: 'processing') => void
+    let report!: (
+      stage: 'preparing' | 'processing',
+      provider?: 'webgpu' | 'wasm',
+    ) => void
     const remove = mock(
       (_input: Blob, options?: RemoveBackgroundOptions) => {
-        report = (stage) =>
-          options?.onProgress?.({ stage, progress: 0.7, message: 'x' })
+        report = (stage, provider) =>
+          options?.onProgress?.({
+            stage,
+            progress: 0.7,
+            message: 'x',
+            provider,
+          })
         return new Promise<BackgroundRemovalResult>((resolve) => {
           finish = resolve
         })
@@ -230,7 +238,13 @@ describe('Remover interrupted runs', () => {
         new File(['a'], 'secret-name.png', { type: 'image/png' }),
       )
       await waitFor(() => expect(remove).toHaveBeenCalledTimes(1))
-      report('processing')
+      report('preparing')
+      // WebGPU may be available, but the provider is recorded only once chosen.
+      expect(readMarker()).toMatchObject({
+        stage: 'preparing',
+        provider: 'unknown',
+      })
+      report('processing', 'wasm')
       const marker = readMarker()
       expect(Object.keys(marker ?? {}).sort()).toEqual([
         'provider',
@@ -327,7 +341,13 @@ describe('Remover interrupted runs', () => {
   })
 
   test('a run that stops reporting progress becomes a retryable error', async () => {
-    const remove = mock(() => new Promise<BackgroundRemovalResult>(() => {}))
+    const signals: (AbortSignal | undefined)[] = []
+    const remove = mock((_input: Blob, options?: RemoveBackgroundOptions) => {
+      signals.push(options?.signal)
+      return signals.length === 1
+        ? new Promise<BackgroundRemovalResult>(() => {})
+        : Promise.resolve(resultWithSource())
+    })
     const view = render(
       <Remover
         removeBackgroundImpl={remove}
@@ -343,6 +363,13 @@ describe('Remover interrupted runs', () => {
       expect(view.getAllByText(/stopped responding/).length).toBeGreaterThan(0)
       expect(failedCalls).toEqual(['inference-failed'])
       expect(readMarker()).toBeNull()
+      // The stalled run is aborted so the browser package can free its slot.
+      expect(signals[0]?.aborted).toBe(true)
+      fireEvent.click(view.getByRole('button', { name: 'Try again' }))
+      await waitFor(() => {
+        expect(view.getByRole('button', { name: /Download PNG/ })).toBeTruthy()
+      })
+      expect(remove).toHaveBeenCalledTimes(2)
     } finally {
       view.unmount()
     }

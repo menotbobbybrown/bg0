@@ -2,7 +2,6 @@ import {
   BackgroundRemovalError,
   type BackgroundRemovalErrorCode,
   type BackgroundRemovalResult,
-  getBrowserCapabilities,
   IMAGE_ACCEPT_ATTRIBUTE,
   isIosBrowser,
   type RemovalProgress,
@@ -304,9 +303,7 @@ export function Remover({
         sourceUrl,
         progress: { stage: 'preparing', progress: 0, message: 'Preparing…' },
       })
-      const marker = startRunMarker(
-        getBrowserCapabilities().webgpu ? 'webgpu' : 'wasm',
-      )
+      const marker = startRunMarker()
       runMarker.current = marker
       // A run that stops reporting progress would otherwise spin forever.
       const stall = createStallGuard(() => {
@@ -347,7 +344,7 @@ export function Remover({
               return
             }
             stall.touch()
-            marker.update(progress.stage)
+            marker.update(progress.stage, progress.provider)
             setState((current) => {
               if (current.status !== 'processing') return current
               const next = { ...current, progress }

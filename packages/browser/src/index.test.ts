@@ -177,7 +177,14 @@ describe('automatic model lifecycle', () => {
         return model('logits') as never
       },
     )
-    expect((await removeBackground(png)).provider).toBe('wasm')
+    const reported: (string | undefined)[] = []
+    const result = await removeBackground(png, {
+      onProgress: ({ provider }) => reported.push(provider),
+    })
+    expect(result.provider).toBe('wasm')
+    // Progress names the provider actually chosen, not the one tried first.
+    expect(reported).toContain('wasm')
+    expect(reported).not.toContain('webgpu')
     expect(load.mock.calls.map((call) => [call[0], call[1]?.device])).toEqual([
       [FULL_MODEL.id, 'webgpu'],
       [LITE_MODEL.id, 'webgpu'],

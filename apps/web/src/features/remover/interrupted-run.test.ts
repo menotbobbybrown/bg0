@@ -29,8 +29,8 @@ function memoryStorage(): Storage {
 describe('interrupted run marker', () => {
   test('stores only stage, provider, and start time', () => {
     const storage = memoryStorage()
-    const run = startRunMarker('webgpu', storage, 1000)
-    run.update('processing')
+    const run = startRunMarker(storage, 1000)
+    run.update('processing', 'webgpu')
     const marker = JSON.parse(storage.getItem(RUN_MARKER_KEY) ?? '')
     // Earlier runs in this process can push startedAt past the given time.
     expect(marker).toEqual({
@@ -45,9 +45,9 @@ describe('interrupted run marker', () => {
 
   test('an older run never clears or overwrites a newer run', () => {
     const storage = memoryStorage()
-    const older = startRunMarker('wasm', storage, 2000)
-    const newer = startRunMarker('wasm', storage, 2000)
-    older.update('finishing')
+    const older = startRunMarker(storage, 2000)
+    const newer = startRunMarker(storage, 2000)
+    older.update('finishing', 'wasm')
     older.clear()
     expect(JSON.parse(storage.getItem(RUN_MARKER_KEY) ?? '')).toMatchObject({
       stage: 'preparing',
@@ -58,13 +58,33 @@ describe('interrupted run marker', () => {
 
   test('a fresh marker is reported once', () => {
     const storage = memoryStorage()
-    startRunMarker('wasm', storage, 5000).update('downloading')
+    startRunMarker(storage, 5000).update('downloading', 'wasm')
     const { startedAt } = JSON.parse(storage.getItem(RUN_MARKER_KEY) ?? '')
     expect(takeInterruptedRun(storage, startedAt + 20_000)).toEqual({
       stage: 'downloading',
       provider: 'wasm',
     })
     expect(takeInterruptedRun(storage, startedAt + 20_000)).toBeUndefined()
+  })
+
+  test('the provider stays unknown until the run reports it', () => {
+    const storage = memoryStorage()
+    const run = startRunMarker(storage, 6000)
+    run.update('downloading')
+    const { startedAt } = JSON.parse(storage.getItem(RUN_MARKER_KEY) ?? '')
+    expect(takeInterruptedRun(storage, startedAt)).toEqual({
+      stage: 'downloading',
+      provider: 'unknown',
+    })
+    const next = startRunMarker(storage, 7000)
+    next.update('processing', 'wasm')
+    // Later stages keep the reported provider.
+    next.update('finishing')
+    expect(JSON.parse(storage.getItem(RUN_MARKER_KEY) ?? '')).toMatchObject({
+      stage: 'finishing',
+      provider: 'wasm',
+    })
+    next.clear()
   })
 
   test.each([
@@ -91,7 +111,7 @@ describe('interrupted run marker', () => {
         throw new Error('denied')
       },
     } as unknown as Storage
-    const run = startRunMarker('wasm', broken)
+    const run = startRunMarker(broken)
     expect(() => run.update('processing')).not.toThrow()
     expect(() => run.clear()).not.toThrow()
     expect(takeInterruptedRun(broken)).toBeUndefined()

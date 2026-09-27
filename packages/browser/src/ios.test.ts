@@ -474,3 +474,71 @@ test.each(['onerror', 'onmessageerror'] as const)(
     }
   },
 )
+
+test('a hung decode is abandoned on abort so a retry runs and the late bitmap is closed', async () => {
+  let late!: () => void
+  let lateClosed = false
+  spyOn(image, 'prepareBoundedImage').mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        late = () =>
+          resolve({
+            data: new Uint8ClampedArray(512 * 512 * 4),
+            width: 512,
+            height: 512,
+            sourceWidth: 768,
+            sourceHeight: 512,
+            bounded: {
+              width: 768,
+              height: 512,
+              close() {
+                lateClosed = true
+              },
+            } as ImageBitmap,
+          })
+      }),
+  )
+  const controller = new AbortController()
+  const hung = removeBackground(png, { signal: controller.signal })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  expect(image.prepareBoundedImage).toHaveBeenCalledTimes(1)
+  controller.abort()
+  await expect(hung).rejects.toMatchObject({ code: 'cancelled' })
+  // The decode is still pending, yet the retry is not queued behind it.
+  expect((await removeBackground(png)).blob).toBe(png)
+  expect(constructed).toBe(1)
+  late()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  expect(lateClosed).toBe(true)
+  expect(image.maskToPng).toHaveBeenCalledTimes(1)
+})
+
+test('a hung PNG encode is abandoned on abort so a retry runs', async () => {
+  let encoding!: () => void
+  const began = new Promise<void>((resolve) => {
+    encoding = resolve
+  })
+  spyOn(image, 'maskToPng').mockImplementationOnce(() => {
+    encoding()
+    return new Promise<Blob>(() => {})
+  })
+  const controller = new AbortController()
+  const hung = removeBackground(png, { signal: controller.signal })
+  await began
+  controller.abort()
+  await expect(hung).rejects.toMatchObject({ code: 'cancelled' })
+  expect(closedBitmaps).toBe(1)
+  expect((await removeBackground(png)).blob).toBe(png)
+  expect(closedBitmaps).toBe(2)
+  // The first worker was released before encoding; the retry starts a fresh one.
+  expect(constructed).toBe(2)
+  expect(disposed).toBe(2)
+})
+
+test('iOS progress reports the WASM provider', async () => {
+  const providers = new Set<string | undefined>()
+  await removeBackground(png, {
+    onProgress: ({ provider }) => providers.add(provider),
+  })
+  expect([...providers]).toEqual(['wasm'])
+})

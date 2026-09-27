@@ -66,6 +66,36 @@ function cancelled(signal?: AbortSignal) {
   if (signal?.aborted)
     throw new BackgroundRemovalError('cancelled', 'Processing was cancelled.')
 }
+// Decoding and PNG encoding run outside the worker, so terminating it cannot
+// stop them. Reject on abort instead, so a hung stage cannot hold the queue
+// and block a retry. A result that arrives after the abort is released and
+// never reaches later work.
+function unlessAborted<T>(
+  task: Promise<T>,
+  signal?: AbortSignal,
+  release?: (value: T) => void,
+): Promise<T> {
+  if (!signal) return task
+  return new Promise<T>((resolve, reject) => {
+    const abort = () =>
+      reject(
+        new BackgroundRemovalError('cancelled', 'Processing was cancelled.'),
+      )
+    if (signal.aborted) abort()
+    else signal.addEventListener('abort', abort, { once: true })
+    task.then(
+      (value) => {
+        signal.removeEventListener('abort', abort)
+        if (signal.aborted) release?.(value)
+        else resolve(value)
+      },
+      (error) => {
+        signal.removeEventListener('abort', abort)
+        reject(error)
+      },
+    )
+  })
+}
 function engine() {
   if (!cached || cached.isDisposed) cached = new IosWorker()
   return cached
@@ -110,7 +140,7 @@ export function removeIosBackground(
       message: string,
     ) => {
       progress = Math.max(progress, value)
-      options.onProgress?.({ stage, progress, message })
+      options.onProgress?.({ stage, progress, message, provider: 'wasm' })
     }
     const abort = () => {
       worker?.dispose(
@@ -120,22 +150,20 @@ export function removeIosBackground(
     }
     try {
       cancelled(options.signal)
-      const format = await validateImage(input)
+      options.signal?.addEventListener('abort', abort, { once: true })
+      const format = await unlessAborted(validateImage(input), options.signal)
       notify('preparing', 0.03, 'Preparing image…')
       // Decode once. Keep only the 512px model input and a copy bounded to the
       // output size; the full-resolution bitmap is closed before model load.
-      const prepared = await prepareBoundedImage(
-        input,
-        512,
-        iosOutputSize,
-        format,
+      const prepared = await unlessAborted(
+        prepareBoundedImage(input, 512, iosOutputSize, format),
+        options.signal,
+        (late) => late.bounded.close(),
       )
       bitmap = prepared.bounded
       cancelled(options.signal)
       worker = engine()
       active = worker
-      options.signal?.addEventListener('abort', abort, { once: true })
-      cancelled(options.signal)
       worker.onStage = (stage, value = 0) =>
         notify(
           stage === 'loading' ? 'downloading' : 'preparing',
@@ -222,8 +250,13 @@ export function removeIosBackground(
       }
       notify('finishing', 0.92, 'Finishing edges…')
       // Bounded original for Compare: don't decode the original camera photo again in the UI.
-      const sourceBlob = await imageToPng(bitmap)
-      const blob = await maskToPng(bitmap, alpha, 512, 512, quality, refinement)
+      // Both encoders draw the bitmap before awaiting, so closing it after an
+      // abort is safe. Each releases its own canvases when it settles.
+      const sourceBlob = await unlessAborted(imageToPng(bitmap), options.signal)
+      const blob = await unlessAborted(
+        maskToPng(bitmap, alpha, 512, 512, quality, refinement),
+        options.signal,
+      )
       cancelled(options.signal)
       notify('finishing', 1, 'Background removed')
       return {

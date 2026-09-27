@@ -204,7 +204,7 @@ export function captureRemovalFailed(
 // Only the stage and provider are sent; never image details.
 export function captureRemovalInterrupted(
   stage: 'preparing' | 'downloading' | 'processing' | 'finishing',
-  provider: 'wasm' | 'webgpu',
+  provider: 'wasm' | 'webgpu' | 'unknown',
 ) {
   capture('background_removal_interrupted', { stage, provider })
 }
