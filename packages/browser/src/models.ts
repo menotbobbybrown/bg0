@@ -57,18 +57,40 @@ export function engineKey(choice: EngineChoice): string {
   return `${choice.definition.id}:${choice.definition.revision}:${choice.provider}`
 }
 
+/** A GPU process that never answers must not hold up the CPU fallback. */
+export const ADAPTER_TIMEOUT_MS = 5_000
+
+function requestAdapterWithin(
+  gpu: NonNullable<HardwareNavigator['gpu']>,
+  timeoutMs: number,
+): Promise<AdapterCapabilities | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  return Promise.race([
+    gpu.requestAdapter(),
+    new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), timeoutMs)
+    }),
+  ]).finally(() => clearTimeout(timer))
+}
+
 /** Missing RAM hints are common; only a reported low-memory device opts out. */
 export async function detectEngineChoices(
   hardware: HardwareNavigator | undefined = typeof navigator === 'undefined'
     ? undefined
     : (navigator as HardwareNavigator),
+  options: { adapterTimeoutMs?: number } = {},
 ): Promise<EngineChoice[]> {
   const choices: EngineChoice[] = []
   const memory = hardware?.deviceMemory
   const lowMemory = Boolean(memory && memory < 4)
   if (hardware && canUseOnnxWebGpu(hardware.userAgent, Boolean(hardware.gpu))) {
     try {
-      const adapter = await hardware.gpu?.requestAdapter()
+      const adapter = hardware.gpu
+        ? await requestAdapterWithin(
+            hardware.gpu,
+            options.adapterTimeoutMs ?? ADAPTER_TIMEOUT_MS,
+          )
+        : null
       if (
         adapter &&
         !adapter.isFallbackAdapter &&

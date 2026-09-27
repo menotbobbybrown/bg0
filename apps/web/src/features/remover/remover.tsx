@@ -336,6 +336,7 @@ export function Remover({
           return
         }
 
+        let announcedDownload = false
         const result = await removeBackgroundImpl(file, {
           quality: 'quality',
           signal: controller.signal,
@@ -349,6 +350,10 @@ export function Remover({
             }
             stall.touch()
             marker.update(progress.stage, progress.provider)
+            if (progress.stage === 'downloading' && !announcedDownload) {
+              announcedDownload = true
+              setAnnouncement(downloadAnnouncement(progress))
+            }
             setState((current) => {
               if (current.status !== 'processing') return current
               const next = { ...current, progress }
@@ -834,7 +839,7 @@ export function Remover({
                 }}
               />
             </div>
-            <div className="absolute inset-x-0 bottom-4 flex justify-center">
+            <div className="absolute inset-x-0 bottom-4 flex flex-col items-center gap-1.5">
               <span className="inline-flex items-center gap-2 rounded-full border border-border bg-background/85 px-3.5 py-1.5 font-mono text-[11px] tracking-wide backdrop-blur-sm">
                 <span
                   className="t-shimmer"
@@ -843,6 +848,11 @@ export function Remover({
                   {progressLabel(state.progress)}
                 </span>
               </span>
+              {progressNote(state.progress, mobile) && (
+                <span className="max-w-[90%] rounded-full bg-background/85 px-3 py-1 text-center text-[11px] text-muted-foreground backdrop-blur-sm">
+                  {progressNote(state.progress, mobile)}
+                </span>
+              )}
             </div>
           </div>
         )}
@@ -1060,10 +1070,34 @@ export function Remover({
 }
 
 function progressLabel(progress: RemovalProgress) {
-  if (progress.stage === 'downloading') {
-    return `${progress.message} · cached after this`
+  if (progress.stage === 'downloading' && progress.download) {
+    const { loadedBytes, totalBytes } = progress.download
+    return `Downloading model · ${toMegabytes(loadedBytes)} of ${toMegabytes(totalBytes)} MB`
   }
   return progress.message
+}
+
+/** A short line under the status pill that sets expectations for slow steps. */
+function progressNote(progress: RemovalProgress, ios: boolean) {
+  if (progress.stage === 'downloading') {
+    return 'First run only. Later runs use the saved model.'
+  }
+  // iPhone and iPad already show their own notice about the lighter model.
+  if (progress.provider === 'wasm' && !ios) {
+    return 'No GPU acceleration in this browser, so this can take a minute.'
+  }
+  return undefined
+}
+
+function downloadAnnouncement(progress: RemovalProgress) {
+  const size = progress.download
+    ? ` (${toMegabytes(progress.download.totalBytes)} MB)`
+    : ''
+  return `Downloading the model${size}. This happens once; later runs use the saved copy.`
+}
+
+function toMegabytes(bytes: number) {
+  return Math.round(bytes / 1_000_000)
 }
 
 function isRetryableError(code: BackgroundRemovalErrorCode): boolean {

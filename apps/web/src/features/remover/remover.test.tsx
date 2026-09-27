@@ -1083,3 +1083,88 @@ function trackObjectUrls() {
     },
   }
 }
+
+describe('Remover loading status', () => {
+  test('shows download sizes, the one-time note and a CPU expectation', async () => {
+    const urls = trackObjectUrls()
+    const request = deferred<BackgroundRemovalResult>()
+    let report: RemoveBackgroundOptions['onProgress']
+    const remove = mock((_input: Blob, options?: RemoveBackgroundOptions) => {
+      report = options?.onProgress
+      return request.promise
+    })
+    const view = render(
+      <Remover
+        removeBackgroundImpl={remove}
+        waitForPaintImpl={() => Promise.resolve()}
+      />,
+    )
+
+    try {
+      const transfer = new DataTransfer()
+      transfer.items.add(new File(['image'], 'a.png', { type: 'image/png' }))
+      fireEvent.paste(window, { clipboardData: transfer })
+      await waitFor(() => expect(remove).toHaveBeenCalledTimes(1))
+
+      act(() =>
+        report?.({
+          stage: 'downloading',
+          progress: 0.3,
+          message: 'Downloading local model…',
+          provider: 'wasm',
+          download: { loadedBytes: 40_000_000, totalBytes: 98_000_000 },
+        }),
+      )
+      expect(
+        view.getAllByText('Downloading model · 40 of 98 MB').length,
+      ).toBeGreaterThan(0)
+      expect(
+        view.getByText('First run only. Later runs use the saved model.'),
+      ).toBeTruthy()
+      const live = view.container.querySelector('[aria-live="polite"]')
+      expect(live?.textContent).toBe(
+        'Downloading the model (98 MB). This happens once; later runs use the saved copy.',
+      )
+
+      act(() =>
+        report?.({
+          stage: 'downloading',
+          progress: 0.5,
+          message: 'Downloading local model…',
+          provider: 'wasm',
+          download: { loadedBytes: 70_000_000, totalBytes: 98_000_000 },
+        }),
+      )
+      expect(
+        view.getAllByText('Downloading model · 70 of 98 MB').length,
+      ).toBeGreaterThan(0)
+
+      act(() =>
+        report?.({
+          stage: 'processing',
+          progress: 0.7,
+          message: 'Removing background…',
+          provider: 'wasm',
+        }),
+      )
+      expect(
+        view.getByText(
+          'No GPU acceleration in this browser, so this can take a minute.',
+        ),
+      ).toBeTruthy()
+
+      act(() =>
+        report?.({
+          stage: 'processing',
+          progress: 0.7,
+          message: 'Removing background…',
+          provider: 'webgpu',
+        }),
+      )
+      expect(view.queryByText(/No GPU acceleration/)).toBeNull()
+    } finally {
+      view.unmount()
+      urls.restore()
+    }
+  })
+})
