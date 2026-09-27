@@ -271,6 +271,44 @@ describe('analytics privacy', () => {
     )
   })
 
+  test('redacts image filenames and dimensions', () => {
+    expect(redactSurveyText('IMG_2041.HEIC lost its hair')).toBe(
+      '[file] lost its hair',
+    )
+    expect(redactSurveyText('my dog.png, 4032 x 3024 photo')).toBe(
+      'my [file], [size] photo',
+    )
+    expect(redactSurveyText('a 1920×1080 banner at 800px')).toBe(
+      'a [size] banner at [size]',
+    )
+  })
+
+  test('keeps a comment that follows a long run of whitespace', () => {
+    expect(redactSurveyText(`${' '.repeat(5000)}edges were soft`)).toBe(
+      'edges were soft',
+    )
+  })
+
+  test('drops survey metadata that is not a short primitive', () => {
+    const result = sanitizeResultSurvey(
+      surveyEvent({
+        $survey_id: SURVEY_ID,
+        $survey_name: 'x'.repeat(201),
+        $survey_iteration: 2,
+        $survey_completed: true,
+        $survey_language: { nested: 'value' },
+        '$survey_response_q-rating': 'Great',
+      }),
+    )
+
+    expect(result?.properties).toEqual({
+      $survey_id: SURVEY_ID,
+      $survey_iteration: 2,
+      $survey_completed: true,
+      '$survey_response_q-rating': 'Great',
+    })
+  })
+
   test('caps the comment at 500 characters and treats blank as unanswered', () => {
     expect(redactSurveyText('a'.repeat(5000))).toHaveLength(500)
     expect(redactSurveyText(`${'b'.repeat(499)} tail`)).toBe('b'.repeat(499))

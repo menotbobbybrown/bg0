@@ -54,7 +54,8 @@ this applies to sent, dismissed, and abandoned events. The only free text is
 the result survey's optional "Anything else we should know?" answer, which
 appears only after a poor rating. Before sending it, BG0 trims it, caps it at
 500 characters, and replaces email addresses, links, `blob:` and `data:` URIs,
-and long numbers such as phone numbers with placeholders. Text is accepted only
+image filenames and dimensions, and long numbers such as phone numbers with
+placeholders. Text is accepted only
 under that question's ID in the survey set in
 `apps/web/src/lib/survey-config.ts`; text on any other answer drops the event.
 The "What was in the image?" question is a category the visitor picks. BG0

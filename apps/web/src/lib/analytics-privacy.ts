@@ -97,6 +97,7 @@ export function durationBucket(durationMs: number): DurationBucket {
 export function redactSurveyText(value: string) {
   return (
     value
+      .trimStart()
       .slice(0, SURVEY_COMMENT_SCAN_LENGTH)
       // A data URI can contain whitespace and markup, so drop everything after
       // it rather than guess where it ends.
@@ -107,6 +108,14 @@ export function redactSurveyText(value: string) {
       // Any word containing @ counts as an email address, including partial
       // addresses cut off by the scan limit.
       .replace(/\S*@\S*/g, '[email]')
+      // Visitors may name the image they processed. Keep its filename and
+      // dimensions in the browser like every other image detail.
+      .replace(
+        /\S*\.(?:jpe?g|png|webp|gif|avif|heic|heif|bmp|tiff?|svg|dng|raw|psd)\b/gi,
+        '[file]',
+      )
+      .replace(/\b\d{2,5}\s*[x×]\s*\d{2,5}\b/gi, '[size]')
+      .replace(/\b\d{2,5}\s*(?:px|pixels)\b/gi, '[size]')
       .replace(/\+?\(?\d(?:[\s().-]{0,2}\d){6,}/g, '[number]')
       .trim()
       .slice(0, SURVEY_COMMENT_MAX_LENGTH)
@@ -212,7 +221,9 @@ function sanitizeSurveyProperties(
       continue
     }
     if (!SURVEY_RESPONSE_KEY.test(key)) {
-      if (ALLOWED_SURVEY_METADATA.has(key)) result[key] = value
+      if (ALLOWED_SURVEY_METADATA.has(key) && isSurveyMetadataValue(value)) {
+        result[key] = value
+      }
       continue
     }
     const isComment =
@@ -230,6 +241,15 @@ function sanitizeSurveyProperties(
     result[key] = value
   }
   return result
+}
+
+// Metadata comes from the survey definition and posthog-js: IDs, the survey
+// name, iteration numbers, dates, flags, and a language code. Anything else
+// is unexpected and dropped.
+function isSurveyMetadataValue(value: unknown) {
+  if (typeof value === 'boolean') return true
+  if (typeof value === 'number') return Number.isFinite(value)
+  return typeof value === 'string' && value.length <= 200
 }
 
 function commentResponseKey(

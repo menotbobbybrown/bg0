@@ -59,7 +59,8 @@ function Privacy() {
         to report app errors. Surveys are multiple choice, plus one optional
         short text answer that only appears after you rate a result poorly.
         Before that text is sent, your browser shortens it to 500 characters and
-        replaces email addresses, links, and long numbers such as phone numbers.
+        replaces email addresses, links, image filenames and sizes, and long
+        numbers such as phone numbers.
         Please don't include personal details. One question asks what kind of
         image you used, such as a product or a pet. That is the category you
         pick; we never work it out from the image. Error reports include a
