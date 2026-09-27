@@ -220,6 +220,50 @@ describe('model download watchdog', () => {
     stalled.dispose()
   })
 
+  test('a stalled file cannot hide behind another that keeps downloading', async () => {
+    const { timers, advance } = fakeTimers()
+    let push: ((chunk: Uint8Array) => void) | undefined
+    const watch = createLoadWatch(
+      async (input) =>
+        String(input).endsWith('.wasm')
+          ? streamResponse([new Uint8Array(8)], { end: false })
+          : new Response(
+              new ReadableStream<Uint8Array>({
+                start(controller) {
+                  push = (chunk) => controller.enqueue(chunk)
+                },
+              }),
+            ),
+      {
+        stallMs: 1000,
+        startMs: 5000,
+        assetOf: (url) => (url.endsWith('.wasm') ? 'runtime' : 'model'),
+        timers,
+      },
+    )
+    const model = (
+      await watch.fetch('https://huggingface.co/a/model.onnx')
+    ).arrayBuffer()
+    const runtime = (
+      await watch.fetch('https://cdn.test/ort.wasm')
+    ).arrayBuffer()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    for (let index = 0; index < 3; index += 1) {
+      await advance(300)
+      push?.(new Uint8Array(4))
+      await Promise.resolve()
+      await Promise.resolve()
+    }
+    expect(watch.signal.aborted).toBe(false)
+    await advance(100)
+    const error = await settledReason(watch.failed)
+    expect((error as ModelDownloadError).reason).toBe('stalled')
+    expect((error as ModelDownloadError).asset).toBe('runtime')
+    await settledReason(model)
+    await settledReason(runtime)
+    watch.dispose()
+  })
+
   test('unread error responses do not count as stalled downloads', async () => {
     const { timers, advance } = fakeTimers()
     const watch = createLoadWatch(

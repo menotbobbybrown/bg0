@@ -89,6 +89,12 @@ export interface LoadWatch {
   dispose: () => void
 }
 
+type OpenRequest = {
+  asset: DownloadAsset
+  /** Set while the request waits on the network for headers or a chunk. */
+  waitingSince: number | undefined
+}
+
 type Fetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
 
 function urlOf(input: RequestInfo | URL): string {
@@ -115,8 +121,10 @@ function combineSignals(signals: AbortSignal[]): AbortSignal {
 
 /**
  * Supervise one model-load attempt. Requests made through `watch.fetch` feed
- * a watchdog. While a download is open, a gap longer than `stallMs` without a
- * new chunk aborts the attempt. With nothing downloading, `startMs` bounds the
+ * a watchdog. Each open request keeps its own clock, so a file that stops
+ * delivering bytes aborts the attempt after `stallMs` even while another
+ * file is still downloading. A request is only owed bytes while it waits for
+ * headers or for a chunk the reader asked for. With nothing downloading, `startMs` bounds the
  * wait for cache reads and runtime initialization, so the caller can always
  * surface an error instead of waiting indefinitely.
  */
@@ -126,8 +134,7 @@ export function createLoadWatch(
 ): LoadWatch {
   const timers = options.timers ?? defaultTimers
   const controller = new AbortController()
-  let openRequests = 0
-  let openModelRequests = 0
+  const requests = new Set<OpenRequest>()
   let lastActivity = timers.now()
   let timer: unknown
   let disposed = false
@@ -152,33 +159,49 @@ export function createLoadWatch(
     timer = undefined
   }
 
+  /** The earliest deadline, and the asset that stalls if it passes. */
+  const nextDeadline = (): { at: number; asset?: DownloadAsset } => {
+    if (requests.size === 0) return { at: lastActivity + options.startMs }
+    let waiting: { at: number; asset: DownloadAsset } | undefined
+    for (const request of requests) {
+      if (request.waitingSince === undefined) continue
+      const at = request.waitingSince + options.stallMs
+      if (!waiting || at < waiting.at) waiting = { at, asset: request.asset }
+    }
+    if (waiting) return waiting
+    // Open bodies nobody is reading still count as an attempt in progress.
+    const model = [...requests].some((request) => request.asset === 'model')
+    return {
+      at: lastActivity + options.stallMs,
+      asset: model ? 'model' : 'runtime',
+    }
+  }
+
   const schedule = () => {
     stop()
     if (disposed || controller.signal.aborted) return
-    const limit = openRequests > 0 ? options.stallMs : options.startMs
-    const remaining = lastActivity + limit - timers.now()
+    const remaining = nextDeadline().at - timers.now()
     timer = timers.setTimeout(check, Math.max(0, remaining))
   }
 
   const check = () => {
     timer = undefined
-    const idle = timers.now() - lastActivity
-    if (openRequests > 0) {
-      if (idle >= options.stallMs) {
-        fail(
-          new ModelDownloadError(
-            'stalled',
-            'The model download stopped making progress',
-            { asset: openModelRequests > 0 ? 'model' : 'runtime' },
-          ),
-        )
-        return
-      }
-    } else if (idle >= options.startMs) {
-      fail(new ModelStartTimeoutError())
+    const deadline = nextDeadline()
+    if (timers.now() < deadline.at) {
+      schedule()
       return
     }
-    schedule()
+    if (deadline.asset) {
+      fail(
+        new ModelDownloadError(
+          'stalled',
+          'The model download stopped making progress',
+          { asset: deadline.asset },
+        ),
+      )
+    } else {
+      fail(new ModelStartTimeoutError())
+    }
   }
 
   const touch = () => {
@@ -194,9 +217,8 @@ export function createLoadWatch(
     if (controller.signal.aborted) throw controller.signal.reason
     const url = urlOf(input)
     const asset = options.assetOf?.(url) ?? 'model'
-    const isModel = asset === 'model'
-    openRequests++
-    if (isModel) openModelRequests++
+    const request: OpenRequest = { asset, waitingSince: timers.now() }
+    requests.add(request)
     touch()
     schedule()
     let response: Response
@@ -208,8 +230,7 @@ export function createLoadWatch(
         signal: combineSignals(signals),
       })
     } catch (error) {
-      openRequests--
-      if (isModel) openModelRequests--
+      requests.delete(request)
       touch()
       schedule()
       if (controller.signal.aborted) throw controller.signal.reason
@@ -220,6 +241,7 @@ export function createLoadWatch(
         }),
       )
     }
+    request.waitingSince = undefined
     touch()
     if (response.status >= 500 || response.status === 408) {
       recordFailure(
@@ -237,8 +259,7 @@ export function createLoadWatch(
       response.status !== 200 ||
       response.type === 'opaque'
     ) {
-      openRequests--
-      if (isModel) openModelRequests--
+      requests.delete(request)
       schedule()
       return response
     }
@@ -259,8 +280,7 @@ export function createLoadWatch(
       if (!open) return
       open = false
       controller.signal.removeEventListener('abort', cancelOnAbort)
-      openRequests--
-      if (isModel) openModelRequests--
+      requests.delete(request)
       touch()
       schedule()
     }
@@ -274,8 +294,11 @@ export function createLoadWatch(
 
     const body = new ReadableStream<Uint8Array>({
       async pull(stream) {
+        // The pending timer is never later than this new deadline.
+        request.waitingSince = timers.now()
         try {
           const { done, value } = await reader.read()
+          request.waitingSince = undefined
           if (controller.signal.aborted) {
             finish()
             stream.error(controller.signal.reason)
