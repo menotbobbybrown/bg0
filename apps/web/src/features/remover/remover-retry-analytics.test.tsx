@@ -3,6 +3,8 @@ import { GlobalRegistrator } from '@happy-dom/global-registrator'
 
 const imageSelectedCalls: string[] = []
 const featureCalls: string[] = []
+const interruptedCalls: [string, string][] = []
+const failedCalls: string[] = []
 
 mock.module('#/lib/analytics', () => ({
   capturePageView: () => {},
@@ -11,7 +13,12 @@ mock.module('#/lib/analytics', () => ({
   },
   captureRemovalSucceeded: () => {},
   showResultSurvey: () => {},
-  captureRemovalFailed: () => {},
+  captureRemovalFailed: (_inputMethod: string, reason: string) => {
+    failedCalls.push(reason)
+  },
+  captureRemovalInterrupted: (stage: string, provider: string) => {
+    interruptedCalls.push([stage, provider])
+  },
   captureResultDownloaded: () => {},
   captureFeatureUsed: (feature: string) => {
     featureCalls.push(feature)
@@ -25,7 +32,10 @@ const { cleanup, fireEvent, render, waitFor } = await import(
   '@testing-library/react'
 )
 
-import type { BackgroundRemovalResult } from '@bg0/browser'
+import type {
+  BackgroundRemovalResult,
+  RemoveBackgroundOptions,
+} from '@bg0/browser'
 
 if (!GlobalRegistrator.isRegistered) {
   GlobalRegistrator.register()
@@ -43,6 +53,9 @@ afterEach(() => {
   cleanup()
   imageSelectedCalls.length = 0
   featureCalls.length = 0
+  interruptedCalls.length = 0
+  failedCalls.length = 0
+  sessionStorage.clear()
 })
 
 afterAll(async () => {
@@ -180,6 +193,156 @@ describe('Remover retry analytics', () => {
         'start_another_image',
         'start_another_image',
       ])
+    } finally {
+      view.unmount()
+    }
+  })
+})
+
+describe('Remover interrupted runs', () => {
+  const KEY = 'bg0:active-removal'
+  const readMarker = () => {
+    const raw = sessionStorage.getItem(KEY)
+    return raw ? (JSON.parse(raw) as Record<string, unknown>) : null
+  }
+
+  test('a run records only stage, provider, and time, then clears on success', async () => {
+    let finish!: (result: BackgroundRemovalResult) => void
+    let report!: (stage: 'processing') => void
+    const remove = mock(
+      (_input: Blob, options?: RemoveBackgroundOptions) => {
+        report = (stage) =>
+          options?.onProgress?.({ stage, progress: 0.7, message: 'x' })
+        return new Promise<BackgroundRemovalResult>((resolve) => {
+          finish = resolve
+        })
+      },
+    )
+    const view = render(
+      <Remover
+        removeBackgroundImpl={remove}
+        waitForPaintImpl={async () => {}}
+      />,
+    )
+    try {
+      selectFile(
+        view,
+        new File(['a'], 'secret-name.png', { type: 'image/png' }),
+      )
+      await waitFor(() => expect(remove).toHaveBeenCalledTimes(1))
+      report('processing')
+      const marker = readMarker()
+      expect(Object.keys(marker ?? {}).sort()).toEqual([
+        'provider',
+        'stage',
+        'startedAt',
+      ])
+      expect(marker).toMatchObject({ stage: 'processing', provider: 'wasm' })
+      expect(sessionStorage.getItem(KEY)).not.toContain('secret-name')
+      finish(resultWithSource())
+      await waitFor(() => {
+        expect(view.getByRole('button', { name: /Download PNG/ })).toBeTruthy()
+      })
+      expect(readMarker()).toBeNull()
+    } finally {
+      view.unmount()
+    }
+  })
+
+  test.each(['failure', 'reset', 'unmount'] as const)(
+    'the marker clears on %s',
+    async (ending) => {
+      let fail!: () => void
+      const remove = mock(
+        () =>
+          new Promise<BackgroundRemovalResult>((_, reject) => {
+            fail = () =>
+              reject(new BackgroundRemovalError('inference-failed', 'boom'))
+          }),
+      )
+      const view = render(
+        <Remover
+          removeBackgroundImpl={remove}
+          waitForPaintImpl={async () => {}}
+        />,
+      )
+      selectFile(view, new File(['a'], 'a.png', { type: 'image/png' }))
+      await waitFor(() => expect(remove).toHaveBeenCalledTimes(1))
+      expect(readMarker()).not.toBeNull()
+      if (ending === 'failure') {
+        fail()
+        await waitFor(() =>
+          expect(view.getByRole('button', { name: 'Try again' })).toBeTruthy(),
+        )
+      } else if (ending === 'reset') {
+        fireEvent.keyDown(window, { key: 'Escape' })
+      }
+      if (ending === 'unmount') view.unmount()
+      expect(readMarker()).toBeNull()
+      if (ending !== 'unmount') view.unmount()
+      expect(interruptedCalls).toEqual([])
+    },
+  )
+
+  test('a page that died mid-run reports it once and explains it', async () => {
+    sessionStorage.setItem(
+      KEY,
+      JSON.stringify({
+        stage: 'processing',
+        provider: 'wasm',
+        startedAt: Date.now() - 20_000,
+      }),
+    )
+    const view = render(<Remover waitForPaintImpl={async () => {}} />)
+    try {
+      await waitFor(() =>
+        expect(interruptedCalls).toEqual([['processing', 'wasm']]),
+      )
+      expect(view.getByRole('status').textContent).toContain(
+        'the browser ran out of memory',
+      )
+      expect(readMarker()).toBeNull()
+    } finally {
+      view.unmount()
+    }
+    const again = render(<Remover waitForPaintImpl={async () => {}} />)
+    again.unmount()
+    expect(interruptedCalls).toHaveLength(1)
+  })
+
+  test('an old marker from an earlier visit is dropped silently', () => {
+    sessionStorage.setItem(
+      KEY,
+      JSON.stringify({
+        stage: 'processing',
+        provider: 'wasm',
+        startedAt: Date.now() - 60 * 60_000,
+      }),
+    )
+    const view = render(<Remover waitForPaintImpl={async () => {}} />)
+    expect(interruptedCalls).toEqual([])
+    expect(view.queryByText(/ran out of memory/)).toBeNull()
+    expect(readMarker()).toBeNull()
+    view.unmount()
+  })
+
+  test('a run that stops reporting progress becomes a retryable error', async () => {
+    const remove = mock(() => new Promise<BackgroundRemovalResult>(() => {}))
+    const view = render(
+      <Remover
+        removeBackgroundImpl={remove}
+        waitForPaintImpl={async () => {}}
+        stallTimeoutMs={30}
+      />,
+    )
+    try {
+      selectFile(view, new File(['a'], 'a.png', { type: 'image/png' }))
+      await waitFor(() =>
+        expect(view.getByRole('button', { name: 'Try again' })).toBeTruthy(),
+      )
+      expect(view.getAllByText(/stopped responding/).length).toBeGreaterThan(0)
+      expect(failedCalls).toEqual(['inference-failed'])
+      expect(readMarker()).toBeNull()
     } finally {
       view.unmount()
     }

@@ -353,6 +353,33 @@ describe('Remover image pickers', () => {
     )
   })
 
+  test('asks the iPhone photo picker for JPEG instead of HEIC, but Files keeps HEIC', async () => {
+    const originalUserAgent = navigator.userAgent
+    Object.defineProperty(navigator, 'userAgent', {
+      configurable: true,
+      value: IPHONE_SAFARI_USER_AGENT,
+    })
+    try {
+      const view = render(<Remover />)
+      await waitFor(() =>
+        expect(
+          view.getByLabelText('Choose a photo').getAttribute('accept'),
+        ).toBe('image/png,image/jpeg,image/webp'),
+      )
+      expect(
+        view
+          .getByLabelText('Choose an image file to remove its background')
+          .getAttribute('accept'),
+      ).toContain('.heic')
+      view.unmount()
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', {
+        configurable: true,
+        value: originalUserAgent,
+      })
+    }
+  })
+
   test('clears file input value on selection to allow picking the same file again', () => {
     const view = render(<Remover />)
     const fileInput = view.getByLabelText(

@@ -1,10 +1,9 @@
 import { BackgroundRemovalError, normalizeError } from './errors'
 import {
-  decodeImage,
   imageToPng,
   inspectMask,
   maskToPng,
-  prepareImageForInference,
+  prepareBoundedImage,
   validateImage,
   findRefinementCrop,
   type MaskRefinement,
@@ -17,6 +16,11 @@ import { iosOutputSize, normalizeIosPixels } from './ios-pixels'
 let queue: Promise<unknown> = Promise.resolve()
 let cached: IosWorker | undefined
 let active: IosWorker | undefined
+// Calls queued behind the running one. When none are waiting after inference,
+// the worker is released so its WASM heap (which never shrinks, roughly 1 GB
+// after one inference) does not stay alive while the PNG is encoded or while
+// the next photo is decoded.
+let waiting = 0
 function serialize<T>(
   operation: () => Promise<T>,
   signal?: AbortSignal,
@@ -31,9 +35,11 @@ function serialize<T>(
       return
     }
     signal?.addEventListener('abort', abort, { once: true })
+    waiting += 1
     // Reject a queued caller immediately without releasing the active queue slot.
     // The skipped slot must still wait for earlier work to prevent overlapping heaps.
     queue = queue.then(async () => {
+      waiting -= 1
       signal?.removeEventListener('abort', abort)
       if (signal?.aborted) return
       try {
@@ -104,17 +110,24 @@ export function removeIosBackground(
       cancelled(options.signal)
       const format = await validateImage(input)
       notify('preparing', 0.03, 'Preparing image…')
-      // Close the original bitmap before loading weights. Retain only 512px RGBA.
-      const prepared = await prepareImageForInference(input, 512, 512, format)
+      // Decode once. Keep only the 512px model input and a copy bounded to the
+      // output size; the full-resolution bitmap is closed before model load.
+      const prepared = await prepareBoundedImage(
+        input,
+        512,
+        iosOutputSize,
+        format,
+      )
+      bitmap = prepared.bounded
       cancelled(options.signal)
       worker = engine()
       active = worker
       options.signal?.addEventListener('abort', abort, { once: true })
       cancelled(options.signal)
-      worker.onStage = (stage) =>
+      worker.onStage = (stage, value = 0) =>
         notify(
           stage === 'loading' ? 'downloading' : 'preparing',
-          stage === 'loading' ? 0.08 : 0.6,
+          stage === 'loading' ? 0.08 + 0.5 * value : 0.6,
           stage === 'loading'
             ? 'Downloading local model…'
             : 'Starting local model…',
@@ -190,18 +203,12 @@ export function removeIosBackground(
         }
       }
       cancelled(options.signal)
-      notify('finishing', 0.92, 'Finishing edges…')
-      bitmap = await decodeImage(input, format)
-      if (bitmap.width !== output.width || bitmap.height !== output.height) {
-        const resized = await createImageBitmap(bitmap, {
-          resizeWidth: output.width,
-          resizeHeight: output.height,
-          resizeQuality: 'high',
-        })
-        bitmap.close()
-        bitmap = resized
+      if (waiting === 0 && cached === worker) {
+        // Free the model heap before encoding. A later call starts a new worker.
+        cached = undefined
+        worker.dispose()
       }
-      cancelled(options.signal)
+      notify('finishing', 0.92, 'Finishing edges…')
       // Bounded original for Compare: don't decode the original camera photo again in the UI.
       const sourceBlob = await imageToPng(bitmap)
       const blob = await maskToPng(bitmap, alpha, 512, 512, quality, refinement)
@@ -233,45 +240,76 @@ export function removeIosBackground(
   }, options.signal)
 }
 
+export interface IosWorkerTimeouts {
+  /** Longest silence allowed while the model downloads and starts. */
+  loadIdleMs?: number
+  /** Longest single inference allowed before the worker is treated as hung. */
+  runMs?: number
+}
+
+const LOAD_IDLE_MS = 90_000
+const RUN_MS = 120_000
+
+function workerError(code: string): BackgroundRemovalError {
+  if (code === 'out-of-memory')
+    return new BackgroundRemovalError(
+      'out-of-memory',
+      'Safari ran out of memory for this image. Close other tabs and try again, or try a smaller image or a desktop browser.',
+    )
+  if (code === 'model-load-failed')
+    return new BackgroundRemovalError(
+      'model-load-failed',
+      'The local model could not be loaded. Check your connection and try again.',
+    )
+  return new BackgroundRemovalError(
+    'inference-failed',
+    'Local processing could not finish. Try a smaller image.',
+  )
+}
+
 export class IosWorker {
   private worker: Worker
   private nextId = 0
   private pending = new Map<
     number,
     {
+      type: 'load' | 'run'
       resolve: (value: { alpha?: ArrayBuffer }) => void
       reject: (error: Error) => void
+      timer?: ReturnType<typeof setTimeout>
     }
   >()
   private loaded?: Promise<void>
   private dead = false
-  onStage?: (stage: string) => void
+  private readonly loadIdleMs: number
+  private readonly runMs: number
+  onStage?: (stage: string, progress?: number) => void
   constructor(
     createWorker = () =>
       new Worker(new URL('./vendor/ios/worker.mjs', import.meta.url), {
         type: 'module',
       }),
+    timeouts: IosWorkerTimeouts = {},
   ) {
+    this.loadIdleMs = timeouts.loadIdleMs ?? LOAD_IDLE_MS
+    this.runMs = timeouts.runMs ?? RUN_MS
     this.worker = createWorker()
     this.worker.onmessage = ({ data }) => {
       if (data.stage) {
-        this.onStage?.(data.stage)
+        // Any sign of life during load restarts the load watchdog.
+        for (const [id, request] of this.pending)
+          if (request.type === 'load') this.watch(id)
+        this.onStage?.(
+          data.stage,
+          typeof data.progress === 'number' ? data.progress : undefined,
+        )
         return
       }
       const request = this.pending.get(data.id)
       if (!request) return
+      clearTimeout(request.timer)
       this.pending.delete(data.id)
-      if (data.error)
-        request.reject(
-          new BackgroundRemovalError(
-            data.error === 'model-load-failed'
-              ? 'model-load-failed'
-              : 'inference-failed',
-            data.error === 'model-load-failed'
-              ? 'The local model could not be loaded. Check your connection and try again.'
-              : 'Local processing could not finish. Try a smaller image.',
-          ),
-        )
+      if (data.error) request.reject(workerError(data.error))
       else request.resolve(data)
     }
     this.worker.onerror = () =>
@@ -298,6 +336,28 @@ export class IosWorker {
       throw new Error('Invalid mask shape')
     return new Float32Array(result.alpha)
   }
+  /** (Re)arm the watchdog so a worker that never answers cannot hang the page. */
+  private watch(id: number) {
+    const request = this.pending.get(id)
+    if (!request) return
+    clearTimeout(request.timer)
+    const load = request.type === 'load'
+    request.timer = setTimeout(
+      () =>
+        this.dispose(
+          load
+            ? new BackgroundRemovalError(
+                'model-load-failed',
+                'The local model stopped responding. Check your connection and try again.',
+              )
+            : new BackgroundRemovalError(
+                'inference-failed',
+                'Local processing stopped responding. Try again, or try a smaller image or a desktop browser.',
+              ),
+        ),
+      load ? this.loadIdleMs : this.runMs,
+    )
+  }
   private request(
     type: 'load' | 'run',
     buffer?: ArrayBuffer,
@@ -305,9 +365,10 @@ export class IosWorker {
     if (this.dead) return Promise.reject(new Error('Worker stopped'))
     const id = ++this.nextId
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject })
+      this.pending.set(id, { type, resolve, reject })
       try {
         this.worker.postMessage({ id, type, buffer }, buffer ? [buffer] : [])
+        this.watch(id)
       } catch (error) {
         this.pending.delete(id)
         reject(error)
@@ -318,7 +379,10 @@ export class IosWorker {
     if (this.dead) return
     this.dead = true
     this.worker.terminate()
-    for (const request of this.pending.values()) request.reject(error)
+    for (const request of this.pending.values()) {
+      clearTimeout(request.timer)
+      request.reject(error)
+    }
     this.pending.clear()
   }
 }

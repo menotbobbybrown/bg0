@@ -1,10 +1,41 @@
 // Same-family BiRefNet-lite experiment. All pixels stay in this browser.
 // A worker prevents blocking the UI; it does NOT bypass the tab memory limit.
 const runtimeUrl = new URL('./ort.wasm.min.mjs', import.meta.url).href;
+// Must match manifest.json. The host serves the model compressed without a
+// Content-Length, so the known size lets the download fill one exact buffer
+// instead of growing copies, and each chunk tells the page's watchdog that
+// the download is still moving.
+const MODEL_BYTES = 55563408;
 let ort;
 let session;
 let size;
 let busy = false;
+async function downloadModel(response) {
+  if (!response.body?.getReader) return new Uint8Array(await response.arrayBuffer());
+  const bytes = new Uint8Array(MODEL_BYTES);
+  const reader = response.body.getReader();
+  let offset = 0;
+  let reported = 0;
+  for (;;) {
+    const {done, value} = await reader.read();
+    if (done) break;
+    if (offset + value.byteLength > MODEL_BYTES) throw new Error('Unexpected model size');
+    bytes.set(value, offset);
+    offset += value.byteLength;
+    if (offset - reported >= MODEL_BYTES / 50) {
+      reported = offset;
+      self.postMessage({stage:'loading', progress: offset / MODEL_BYTES});
+    }
+  }
+  if (offset !== MODEL_BYTES) throw new Error('Unexpected model size');
+  return bytes;
+}
+// Report allocation failures by category so the page can explain them.
+function failure(type, error) {
+  const text = `${error?.name ?? ''} ${error?.message ?? error ?? ''}`.toLowerCase();
+  if (error instanceof RangeError || /memory|alloc|\boom\b/.test(text)) return 'out-of-memory';
+  return type === 'load' ? 'model-load-failed' : 'inference-failed';
+}
 self.onmessage = async ({data}) => {
   const {id,type} = data;
   if (busy) { self.postMessage({id,error:'Already processing'}); return; }
@@ -27,7 +58,7 @@ ort.env.wasm.wasmPaths = {
       self.postMessage({stage:'loading'});
       const response = await fetch(new URL('./int8-full-512.ort',import.meta.url));
       if (!response.ok) throw new Error('Model download failed');
-      let bytes = new Uint8Array(await response.arrayBuffer());
+      let bytes = await downloadModel(response);
       self.postMessage({stage:'starting'});
       session = await ort.InferenceSession.create(bytes, {
         executionProviders:['wasm'], executionMode:'sequential',
@@ -52,7 +83,7 @@ ort.env.wasm.wasmPaths = {
       self.postMessage({id,alpha:alpha.buffer},[alpha.buffer]);
     } else throw new Error('Unknown action');
   } catch(error) {
-    self.postMessage({id,error: type === 'load' ? 'model-load-failed' : 'inference-failed'});
+    self.postMessage({id,error: failure(type, error)});
   } finally {
     input?.dispose();
     if(outputs)for(const tensor of Object.values(outputs))tensor.dispose();

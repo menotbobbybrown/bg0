@@ -69,3 +69,104 @@ test.each([-100, 100, 0, NaN])(
     expect(released).toBe(2)
   },
 )
+
+const MODEL_BYTES = 55563408
+
+function loadWorker(
+  body: Uint8Array[] | undefined,
+  create: () => Promise<object> = async () => ({}),
+) {
+  const messages: {
+    id?: number
+    error?: string
+    stage?: string
+    progress?: number
+    ready?: boolean
+  }[] = []
+  let received = 0
+  const scope = {
+    onmessage: undefined as unknown as (event: {
+      data: object
+    }) => Promise<void>,
+    postMessage: (data: (typeof messages)[number]) => messages.push(data),
+  }
+  runInNewContext(source, {
+    URL,
+    Uint8Array,
+    RangeError,
+    self: scope,
+    loadRuntime: async () => ({
+      env: { wasm: {} },
+      InferenceSession: {
+        create: async (bytes: Uint8Array) => {
+          received = bytes.byteLength
+          return create()
+        },
+      },
+    }),
+    fetch: async () => ({
+      ok: true,
+      body: body && {
+        getReader: () => {
+          const chunks = [...body]
+          return {
+            read: async () =>
+              chunks.length
+                ? { done: false, value: chunks.shift() }
+                : { done: true },
+          }
+        },
+      },
+      arrayBuffer: async () => new ArrayBuffer(1),
+    }),
+  })
+  return {
+    messages,
+    received: () => received,
+    load: () => scope.onmessage({ data: { id: 1, type: 'load' } }),
+  }
+}
+
+test('worker model size matches the pinned manifest', () => {
+  const manifest = JSON.parse(
+    readFileSync(
+      new URL('../vendor/ios/manifest.json', import.meta.url),
+      'utf8',
+    ),
+  )
+  expect(manifest.files['int8-full-512.ort'].bytes).toBe(MODEL_BYTES)
+  expect(source).toContain(`const MODEL_BYTES = ${MODEL_BYTES};`)
+})
+
+test('worker streams the model into one exact buffer and reports progress', async () => {
+  const chunk = new Uint8Array(MODEL_BYTES / 4)
+  const worker = loadWorker([chunk, chunk, chunk, chunk])
+  await worker.load()
+  expect(worker.received()).toBe(MODEL_BYTES)
+  const progress = worker.messages
+    .filter((m) => m.stage === 'loading' && m.progress !== undefined)
+    .map((m) => m.progress)
+  expect(progress).toEqual([0.25, 0.5, 0.75, 1])
+  expect(worker.messages.at(-1)).toEqual({ id: 1, ready: true })
+})
+
+test.each([
+  ['short', [new Uint8Array(10)]],
+  ['oversized', [new Uint8Array(MODEL_BYTES), new Uint8Array(1)]],
+])('worker rejects a %s model download', async (_, chunks) => {
+  const worker = loadWorker(chunks)
+  await worker.load()
+  expect(worker.messages.at(-1)).toEqual({ id: 1, error: 'model-load-failed' })
+})
+
+test.each([
+  ['RangeError', () => new RangeError('Array buffer allocation failed')],
+  ['WASM abort', () => new Error('Aborted(OOM)')],
+  ['allocation text', () => new Error('failed to allocate a buffer')],
+])('worker reports %s as out of memory', async (_, error) => {
+  const worker = loadWorker(undefined, async () => {
+    throw error()
+  })
+  await worker.load()
+  expect(worker.messages.at(-1)).toEqual({ id: 1, error: 'out-of-memory' })
+})

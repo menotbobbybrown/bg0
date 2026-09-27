@@ -108,17 +108,32 @@ per-tap GridSample operations, deduplicates weights, and uses dynamic uint8
 Conv/MatMul quantization. Its weights derive from the official BiRefNet-lite
 checkpoint, not a different network family. Quantization can change results.
 
-Before loading, reduce the decoded photo to 512px pixels and release its bitmap.
-iOS skips eager warming/full-photo processing previews. After inference, exports
+The photo is decoded once. That decode yields the 512px model input and a copy
+bounded to the export size, and the full-resolution bitmap is closed before the
+model loads; finishing never decodes the photo again. iOS skips eager warming/full-photo processing previews. After inference, exports
 and the Compare source are capped at 1280px longest-edge (disclosed by the UI).
 The quality option retains the optional focused refinement pass. This cap is a
 reviewable memory/quality tradeoff, not a claim of original-resolution export.
 
-Calls are serialized; repeated calls reuse the worker. Abort terminates it and
-settles pending requests. Cache reset defers retirement until active work ends.
+Calls are serialized. Queued calls reuse the worker; when nothing is queued after
+inference, the worker is terminated before PNG encoding, because its WASM heap
+never shrinks. The next photo starts a new worker from the HTTP-cached files.
+The model streams into one buffer of its known size. Worker requests have a
+watchdog (load: no progress for 90 s; inference: 120 s) that terminates the
+worker and returns a retryable error, and allocation failures are reported as
+out-of-memory. Abort terminates the worker and settles pending requests. Cache reset defers retirement until active work ends.
 Buffers are transferred rather than cloned. Model-load failures are retryable;
 no fallback to the known memory-heavy iPhone model is attempted. The worker does
 not bypass Safari's per-tab memory budget.
+
+When Safari exceeds that budget it kills the page and reloads it, so no failure
+event can be sent. The remover keeps a sessionStorage marker during each run
+that holds only the stage, the expected provider, and the start time. A marker
+found on the next load within 10 minutes produces one anonymous
+`background_removal_interrupted` event with only `stage` and `provider`, and an
+explanation for the user. Success, failure, cancel, reset, unmount, and
+`pagehide` clear it. A run with no progress for 5 minutes on any platform
+becomes a retryable error.
 
 PNG compositing uses one output canvas, releasing temporary mask/output buffers
 after encoding (including failure paths). This allocation improvement is shared

@@ -318,6 +318,68 @@ export async function prepareImageForInference(
   }
 }
 
+export interface BoundedInferenceImage extends PreparedInferenceImage {
+  /** The photo reduced to the output size. The caller must close it. */
+  bounded: ImageBitmap
+}
+
+/**
+ * Decode the photo exactly once for a bounded-output path. The model input and
+ * a small export copy are taken from the same decode, and the full-resolution
+ * bitmap (192 MB for a 48 MP photo) is closed before this resolves, so it never
+ * coexists with the model's memory or needs a second decode when finishing.
+ */
+export async function prepareBoundedImage(
+  input: Blob,
+  size: number,
+  outputSize: (
+    width: number,
+    height: number,
+  ) => { width: number; height: number },
+  format?: SupportedImageFormat,
+  decode: (
+    input: Blob,
+    format?: SupportedImageFormat,
+  ) => Promise<ImageBitmap> = decodeImage,
+): Promise<BoundedInferenceImage> {
+  const image = await decode(input, format)
+  let keepImage = false
+  try {
+    const canvas = document.createElement('canvas')
+    let data: Uint8ClampedArray
+    try {
+      canvas.width = size
+      canvas.height = size
+      const context = canvas.getContext('2d', { willReadFrequently: true })
+      if (!context) throw new Error('Canvas is unavailable')
+      context.drawImage(image, 0, 0, size, size)
+      data = context.getImageData(0, 0, size, size).data
+    } finally {
+      releaseCanvas(canvas)
+    }
+    const output = outputSize(image.width, image.height)
+    let bounded = image
+    if (output.width !== image.width || output.height !== image.height) {
+      bounded = await createImageBitmap(image, {
+        resizeWidth: output.width,
+        resizeHeight: output.height,
+        resizeQuality: 'high',
+      })
+    }
+    keepImage = bounded === image
+    return {
+      data,
+      width: size,
+      height: size,
+      sourceWidth: image.width,
+      sourceHeight: image.height,
+      bounded,
+    }
+  } finally {
+    if (!keepImage) image.close()
+  }
+}
+
 export interface MaskInspection {
   valid: boolean
   hasForegroundSignal: boolean

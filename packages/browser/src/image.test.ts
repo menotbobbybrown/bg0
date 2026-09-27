@@ -8,6 +8,7 @@ import {
   imageToPng,
   MAX_IMAGE_BYTES,
   maskToPng,
+  prepareBoundedImage,
   sniffImageFormat,
   validateImage,
 } from './image'
@@ -565,6 +566,125 @@ describe('maskToPng refinement', () => {
         value: originalDocument,
       })
     }
+  })
+})
+
+describe('prepareBoundedImage', () => {
+  async function prepare(
+    width: number,
+    height: number,
+    options: { failCanvas?: boolean; failResize?: boolean } = {},
+  ) {
+    const originalDocument = Object.getOwnPropertyDescriptor(
+      globalThis,
+      'document',
+    )
+    const originalBitmap = Object.getOwnPropertyDescriptor(
+      globalThis,
+      'createImageBitmap',
+    )
+    const canvases: { width: number; height: number }[] = []
+    const resizes: unknown[] = []
+    let decodes = 0
+    let closed = 0
+    const source = {
+      width,
+      height,
+      close: () => {
+        closed++
+      },
+    } as ImageBitmap
+    Object.defineProperty(globalThis, 'document', {
+      configurable: true,
+      value: {
+        createElement: () => {
+          const canvas = {
+            width: 0,
+            height: 0,
+            getContext: () =>
+              options.failCanvas
+                ? null
+                : {
+                    drawImage() {},
+                    getImageData: (_x: number, _y: number, w: number, h: number) => ({
+                      data: new Uint8ClampedArray(w * h * 4),
+                    }),
+                  },
+          }
+          canvases.push(canvas)
+          return canvas
+        },
+      },
+    })
+    Object.defineProperty(globalThis, 'createImageBitmap', {
+      configurable: true,
+      value: async (_image: ImageBitmap, resize: { resizeWidth: number; resizeHeight: number }) => {
+        resizes.push(resize)
+        if (options.failResize) throw new Error('resize failed')
+        return { width: resize.resizeWidth, height: resize.resizeHeight, close() {} }
+      },
+    })
+    try {
+      const result = await prepareBoundedImage(
+        new Blob(['jpeg'], { type: 'image/jpeg' }),
+        512,
+        (w, h) => {
+          const scale = Math.min(1, 1280 / Math.max(w, h))
+          return { width: Math.round(w * scale), height: Math.round(h * scale) }
+        },
+        'jpeg',
+        async () => {
+          decodes++
+          return source
+        },
+      ).then(
+        (value) => ({ value }),
+        (error: unknown) => ({ error }),
+      )
+      return { result, canvases, resizes, decodes: () => decodes, closed: () => closed, source }
+    } finally {
+      for (const [name, descriptor] of [
+        ['document', originalDocument],
+        ['createImageBitmap', originalBitmap],
+      ] as const) {
+        if (descriptor) Object.defineProperty(globalThis, name, descriptor)
+        else Reflect.deleteProperty(globalThis, name)
+      }
+    }
+  }
+
+  test('decodes a 48 MP photo once and keeps only bounded copies', async () => {
+    const run = await prepare(8000, 6000)
+    if (!('value' in run.result)) throw run.result.error
+    const prepared = run.result.value
+    expect(run.decodes()).toBe(1)
+    expect(prepared.data.byteLength).toBe(512 * 512 * 4)
+    expect(prepared).toMatchObject({ sourceWidth: 8000, sourceHeight: 6000 })
+    expect(prepared.bounded).toMatchObject({ width: 1280, height: 960 })
+    expect(run.resizes).toEqual([
+      { resizeWidth: 1280, resizeHeight: 960, resizeQuality: 'high' },
+    ])
+    // The full-resolution bitmap and the 512px canvas are both released.
+    expect(run.closed()).toBe(1)
+    expect(run.canvases.every((c) => c.width === 0 && c.height === 0)).toBe(true)
+  })
+
+  test('reuses a small photo instead of upscaling or copying it', async () => {
+    const run = await prepare(768, 512)
+    if (!('value' in run.result)) throw run.result.error
+    expect(run.result.value.bounded).toBe(run.source)
+    expect(run.resizes).toEqual([])
+    expect(run.closed()).toBe(0)
+  })
+
+  test.each([
+    ['canvas', { failCanvas: true }],
+    ['resize', { failResize: true }],
+  ] as const)('closes the decoded photo when %s fails', async (_, options) => {
+    const run = await prepare(8000, 6000, options)
+    expect('error' in run.result).toBe(true)
+    expect(run.closed()).toBe(1)
+    expect(run.canvases.every((c) => c.width === 0 && c.height === 0)).toBe(true)
   })
 })
 
