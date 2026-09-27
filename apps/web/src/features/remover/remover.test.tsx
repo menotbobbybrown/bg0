@@ -32,9 +32,12 @@ globalThis.IntersectionObserver =
   IntersectionObserverStub as unknown as typeof IntersectionObserver
 
 afterEach(cleanup)
-afterAll(() => {
+afterAll(async () => {
+  // React can still have a scheduled commit callback after the last cleanup.
+  // Let it run before the DOM globals it reads are removed.
+  await new Promise((resolve) => setTimeout(resolve, 50))
   if (GlobalRegistrator.isRegistered) {
-    void GlobalRegistrator.unregister()
+    await GlobalRegistrator.unregister()
   }
 })
 
