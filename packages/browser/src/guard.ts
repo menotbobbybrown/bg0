@@ -8,6 +8,16 @@
  * survives a crash-and-reload of the same tab but not other tabs, so a marker
  * found on the next detection means this tab died during full-model work. The
  * device then uses the lite model for a week.
+ *
+ * Reloading or leaving the page also ends the document before work settles,
+ * so `pagehide` clears the marker and `pageshow` sets it again if the page
+ * comes back from the back/forward cache with work still running. This is
+ * done whether or not the event is `persisted`: a frozen page that is later
+ * dropped from that cache was not killed by the model. A tab killed for
+ * memory gets no `pagehide`, so its marker survives. The trade-off is iOS
+ * Safari, which can fire `pagehide` when the user switches away and later
+ * discard the hidden tab silently. That kill is not counted, which only
+ * means the full model is tried again; a crash in the foreground still is.
  */
 
 const RUNNING_KEY = 'bg0:full-model-running:v1'
@@ -15,6 +25,7 @@ const BLOCKED_KEY = 'bg0:full-model-blocked:v1'
 const BLOCK_MS = 7 * 24 * 60 * 60 * 1000
 
 let running = 0
+let stopWatchingPage: (() => void) | undefined
 
 function session(): Storage | undefined {
   try {
@@ -63,15 +74,39 @@ export function isFullModelBlocked(now = Date.now()): boolean {
   return false
 }
 
+function setMarker(): void {
+  try {
+    session()?.setItem(RUNNING_KEY, '1')
+  } catch {
+    // Crash detection is best effort.
+  }
+}
+
+function clearMarker(): void {
+  try {
+    session()?.removeItem(RUNNING_KEY)
+  } catch {
+    // Crash detection is best effort.
+  }
+}
+
+function watchPage(): (() => void) | undefined {
+  if (typeof window === 'undefined') return undefined
+  const page = window
+  page.addEventListener('pagehide', clearMarker)
+  page.addEventListener('pageshow', setMarker)
+  return () => {
+    page.removeEventListener('pagehide', clearMarker)
+    page.removeEventListener('pageshow', setMarker)
+  }
+}
+
 /** Mark full-model work as in progress. Call the returned function once when it settles. */
 export function markFullModelRunning(): () => void {
   running += 1
   if (running === 1) {
-    try {
-      session()?.setItem(RUNNING_KEY, '1')
-    } catch {
-      // Crash detection is best effort.
-    }
+    setMarker()
+    stopWatchingPage = watchPage()
   }
   let done = false
   return () => {
@@ -79,11 +114,9 @@ export function markFullModelRunning(): () => void {
     done = true
     running -= 1
     if (running === 0) {
-      try {
-        session()?.removeItem(RUNNING_KEY)
-      } catch {
-        // Crash detection is best effort.
-      }
+      stopWatchingPage?.()
+      stopWatchingPage = undefined
+      clearMarker()
     }
   }
 }
