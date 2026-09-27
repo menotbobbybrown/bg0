@@ -81,7 +81,7 @@ describe('validateImage', () => {
     await expect(validateImage(image)).rejects.toMatchObject({
       code: 'image-too-large',
       message:
-        'This file is 61 MB, and BG0 takes images up to 60 MB. Save it as a JPG or at a smaller size, then try again.',
+        'This file is 60.1 MB, and BG0 takes images up to 60 MB. Save it as a JPG or at a smaller size, then try again.',
     })
   })
 
@@ -91,7 +91,7 @@ describe('validateImage', () => {
       type: 'image/jpeg',
     })
     await expect(validateImage(image)).rejects.toMatchObject({
-      message: expect.stringContaining('This file is 63 MB'),
+      message: expect.stringContaining('This file is 62.9 MB'),
     })
   })
 
