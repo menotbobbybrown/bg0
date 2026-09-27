@@ -76,4 +76,38 @@ describe('safe model cache', () => {
       Response,
     )
   })
+
+  test('a write still in flight cannot restore an evicted model', async () => {
+    const entries = new Map<string, Response>()
+    let finishWrite: () => void = () => undefined
+    const inner: ModelCache = {
+      match: async (key) => entries.get(String(key)),
+      put: async (key, response) => {
+        await new Promise<void>((resolve) => {
+          finishWrite = resolve
+        })
+        entries.set(String(key), response)
+      },
+      delete: async (key) => entries.delete(String(key)),
+    }
+    const cache = createSafeCache(async () => inner)
+    await cache.put(url, sized(4))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    // The runtime rejects the model and it is evicted before its write lands.
+    await cache.delete(url)
+    finishWrite()
+    await Promise.resolve()
+    expect(await cache.match(url)).toBeUndefined()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(entries.has(url)).toBe(false)
+    expect(await cache.match(url)).toBeUndefined()
+
+    // A fresh download after the eviction is cached normally.
+    await cache.put(url, sized(4))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    finishWrite()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(await cache.match(url)).toBeInstanceOf(Response)
+  })
 })

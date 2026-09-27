@@ -8,7 +8,8 @@
  * from a cache, `match` and `put`, on top of it.
  *
  * Files are stored in chunks so a 200 MB model never becomes a single record,
- * and writes happen in the background so inference is never held up by disk.
+ * and `createSafeCache` runs writes in the background so inference is never
+ * held up by disk.
  */
 
 const DB_NAME = 'bg0-model-cache'
@@ -167,10 +168,11 @@ export function createIndexedDbCache(): ModelCache {
       for (const [name, value] of response.headers) {
         if (name.toLowerCase() !== 'content-length') headers.push([name, value])
       }
-      // Do not block model loading on the disk write. A failed write only
-      // means the next visit downloads again.
+      // Resolve only once the write settles so an eviction can tell when a
+      // late write has landed. `createSafeCache` keeps loads from waiting on
+      // it. A failed write only means the next visit downloads again.
       pendingWrites.add(key)
-      void write(key, body, headers)
+      await write(key, body, headers)
         .catch((error) => {
           console.warn('BG0 could not cache the model locally:', error)
         })
@@ -202,6 +204,11 @@ export async function clearIndexedDbCache(): Promise<void> {
  * Reads that fail count as a miss. A cached entry whose recorded size differs
  * from the expected size is removed instead of being handed to the runtime,
  * because a truncated model fails every later load until it is replaced.
+ *
+ * A model can be rejected and evicted before its own background write lands.
+ * Eviction therefore reads the key as a miss until every write already in
+ * flight has settled, then deletes it again, so a late write cannot restore
+ * the evicted file.
  */
 export function createSafeCache(
   open: () => Promise<ModelCache | undefined>,
@@ -212,6 +219,8 @@ export function createSafeCache(
     opened ??= open().catch(() => undefined)
     return opened
   }
+  const writes = new Map<string, Set<Promise<void>>>()
+  const evicting = new Map<string, Promise<unknown>>()
   const remove = async (input: RequestInfo | URL) => {
     try {
       return Boolean(await (await cache())?.delete?.(input))
@@ -219,9 +228,22 @@ export function createSafeCache(
       return false
     }
   }
+  const evict = (input: RequestInfo | URL) => {
+    const key = keyOf(input)
+    const pending = writes.get(key)
+    if (pending?.size) {
+      const settled = Promise.all(pending).then(() => remove(input))
+      evicting.set(key, settled)
+      void settled.finally(() => {
+        if (evicting.get(key) === settled) evicting.delete(key)
+      })
+    }
+    return remove(input)
+  }
 
   return {
     async match(input) {
+      if (evicting.has(keyOf(input))) return undefined
       let response: Response | undefined
       try {
         response = (await (await cache())?.match(input)) ?? undefined
@@ -236,20 +258,30 @@ export function createSafeCache(
         length !== null &&
         Number(length) !== expected
       ) {
-        await remove(input)
+        await evict(input)
         return undefined
       }
       return response
     },
     async put(input, response) {
-      void (async () => {
+      const key = keyOf(input)
+      const write = (async () => {
         try {
           await (await cache())?.put(input, response)
         } catch {
           // Caching is an optimization. The model is already in memory.
         }
       })()
+      const pending = writes.get(key) ?? new Set()
+      pending.add(write)
+      writes.set(key, pending)
+      void write.finally(() => {
+        pending.delete(write)
+        if (pending.size === 0 && writes.get(key) === pending) {
+          writes.delete(key)
+        }
+      })
     },
-    delete: remove,
+    delete: evict,
   }
 }
