@@ -4,8 +4,8 @@ import {
   decodeImage,
   detectImageFormat,
   findRefinementCrop,
-  inspectMask,
   imageToPng,
+  inspectMask,
   MAX_IMAGE_BYTES,
   maskToPng,
   prepareBoundedImage,
@@ -82,6 +82,16 @@ describe('validateImage', () => {
       code: 'image-too-large',
       message:
         'This file is 61 MB, and BG0 takes images up to 60 MB. Save it as a JPG or at a smaller size, then try again.',
+    })
+  })
+
+  test('reports sizes in the decimal megabytes phones and Finder show', async () => {
+    // 60 MiB is 62.9 MB in Finder and the iOS Files app.
+    const image = new Blob([new Uint8Array(60 * 1024 * 1024)], {
+      type: 'image/jpeg',
+    })
+    await expect(validateImage(image)).rejects.toMatchObject({
+      message: expect.stringContaining('This file is 63 MB'),
     })
   })
 
