@@ -1080,7 +1080,7 @@ function progressLabel(progress: RemovalProgress) {
 /** A short line under the status pill that sets expectations for slow steps. */
 function progressNote(progress: RemovalProgress, ios: boolean) {
   if (progress.stage === 'downloading') {
-    return 'First run only. Later runs use the saved model.'
+    return 'Usually a one-time download, so later runs are faster.'
   }
   // iPhone and iPad already show their own notice about the lighter model.
   if (progress.provider === 'wasm' && !ios) {
@@ -1093,7 +1093,7 @@ function downloadAnnouncement(progress: RemovalProgress) {
   const size = progress.download
     ? ` (${toMegabytes(progress.download.totalBytes)} MB)`
     : ''
-  return `Downloading the model${size}. This happens once; later runs use the saved copy.`
+  return `Downloading the model${size}. BG0 tries to keep it so later runs are faster.`
 }
 
 function toMegabytes(bytes: number) {

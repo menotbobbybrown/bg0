@@ -439,10 +439,16 @@ async function getPreferredEngine(
   // A model whose download failed is not retried with another runtime in the
   // same walk: the file is shared, so the second attempt would fail the same way.
   const unreachableModels = new Set<string>()
+  // Runtime files differ per provider, so their failure only skips that one.
+  const unreachableProviders = new Set<ExecutionProvider>()
   for (const choice of choices) {
     throwIfCancelled(signal)
     const key = engineKey(choice)
-    if (failedEngines.has(key) || unreachableModels.has(choice.definition.id))
+    if (
+      failedEngines.has(key) ||
+      unreachableModels.has(choice.definition.id) ||
+      unreachableProviders.has(choice.provider)
+    )
       continue
     const cached = await isModelCached(choice.definition)
     throwIfCancelled(signal)
@@ -464,8 +470,12 @@ async function getPreferredEngine(
         break
       }
       if (error instanceof ModelDownloadError) {
-        // Network trouble says nothing about the GPU. Do not disable WebGPU,
-        // but stop re-downloading the large model in this session.
+        // Network trouble says nothing about the GPU. Do not disable WebGPU.
+        if (error.asset === 'runtime') {
+          unreachableProviders.add(choice.provider)
+          continue
+        }
+        // Stop re-downloading the large model in this session.
         unreachableModels.add(choice.definition.id)
         if (choice.definition.name === 'birefnet') failedEngines.add(key)
         continue
@@ -847,13 +857,18 @@ function superviseFetch(env: TransformersEnv): TransformersEnv['fetch'] {
             : input.url
       const loads = [...watchedLoads]
       const owner =
-        loads.find((entry) => url.includes(`/${entry.definition.id}/`)) ??
+        loads.find((entry) => isModelFileUrl(url, entry.definition)) ??
         loads.at(-1)
       return owner ? owner.watch.fetch(input, init) : baseFetch(input, init)
     }
     env.fetch = supervisedFetch
   }
   return baseFetch
+}
+
+function isModelFileUrl(url: string, definition?: ModelDefinition): boolean {
+  const definitions = definition ? [definition] : [LITE_MODEL, FULL_MODEL]
+  return definitions.some((entry) => url.includes(`/${entry.id}/`))
 }
 
 function baseFetch(input: RequestInfo | URL, init?: RequestInit) {
@@ -882,6 +897,8 @@ async function loadEngine(
     ...modelLoadTimings,
     expectedBytes: (url) =>
       url === modelUrl(definition) ? definition.bytes : undefined,
+    // Model files carry the model id in their URL, as in `superviseFetch`.
+    assetOf: (url) => (isModelFileUrl(url) ? 'model' : 'runtime'),
   })
   const watched = { watch, definition }
   watchedLoads.add(watched)

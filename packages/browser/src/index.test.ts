@@ -542,7 +542,8 @@ describe('model load recovery', () => {
       message:
         'The local model could not be loaded. Check your connection and try again.',
     })
-    // The lite file is shared by both runtimes, so it is not fetched twice.
+    // The lite file is shared by both runtimes, so it is not fetched twice,
+    // even though the WASM runtime files differ from the WebGPU ones.
     expect(load.mock.calls.map((call) => [call[0], call[1]?.device])).toEqual([
       [FULL_MODEL.id, 'webgpu'],
       [LITE_MODEL.id, 'webgpu'],
@@ -551,6 +552,46 @@ describe('model load recovery', () => {
     online = true
     expect(await removeBackground(png)).toMatchObject({
       model: 'birefnet-lite',
+      provider: 'webgpu',
+    })
+  })
+
+  test('a failed WebGPU runtime file falls back to lite WASM', async () => {
+    let online = false
+    env.fetch = mock(async (input: RequestInfo | URL) => {
+      if (!online && String(input).includes('jsep')) {
+        throw new TypeError('Failed to fetch')
+      }
+      return new Response('ok')
+    })
+    const load = spyOn(AutoModel, 'from_pretrained').mockImplementation(
+      async (id, options) => {
+        await (
+          await env.fetch(`https://huggingface.co/${id}/config.json`)
+        ).arrayBuffer()
+        const runtime =
+          options?.device === 'webgpu'
+            ? 'ort-wasm-simd-threaded.jsep.wasm'
+            : 'ort-wasm-simd-threaded.wasm'
+        await (
+          await env.fetch(`https://cdn.jsdelivr.net/npm/ort/dist/${runtime}`)
+        ).arrayBuffer()
+        return model('logits') as never
+      },
+    )
+    expect(await removeBackground(png)).toMatchObject({
+      model: 'birefnet-lite',
+      provider: 'wasm',
+    })
+    // The model files were reachable, so only the GPU runtime is skipped.
+    expect(load.mock.calls.map((call) => [call[0], call[1]?.device])).toEqual([
+      [FULL_MODEL.id, 'webgpu'],
+      [LITE_MODEL.id, 'wasm'],
+    ])
+    expect(storage.size).toBe(0)
+    online = true
+    expect(await removeBackground(png)).toMatchObject({
+      model: 'birefnet',
       provider: 'webgpu',
     })
   })

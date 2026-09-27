@@ -12,17 +12,25 @@
 
 export type DownloadFailureReason = 'network' | 'stalled' | 'incomplete'
 
+/**
+ * What failed to download. Model files are shared by every runtime, while
+ * runtime files, such as the ONNX Runtime binary, differ per provider.
+ */
+export type DownloadAsset = 'model' | 'runtime'
+
 export class ModelDownloadError extends Error {
   readonly reason: DownloadFailureReason
+  readonly asset: DownloadAsset
 
   constructor(
     reason: DownloadFailureReason,
     message: string,
-    options?: ErrorOptions,
+    options?: ErrorOptions & { asset?: DownloadAsset },
   ) {
     super(message, options)
     this.name = 'ModelDownloadError'
     this.reason = reason
+    this.asset = options?.asset ?? 'model'
   }
 }
 
@@ -64,6 +72,8 @@ export interface LoadWatchOptions {
   startMs: number
   /** Expected byte size for exact URLs; a shorter body is rejected. */
   expectedBytes?: (url: string) => number | undefined
+  /** Classify a request URL. Unclassified requests count as model files. */
+  assetOf?: (url: string) => DownloadAsset
   timers?: Timers
 }
 
@@ -117,6 +127,7 @@ export function createLoadWatch(
   const timers = options.timers ?? defaultTimers
   const controller = new AbortController()
   let openRequests = 0
+  let openModelRequests = 0
   let lastActivity = timers.now()
   let timer: unknown
   let disposed = false
@@ -158,6 +169,7 @@ export function createLoadWatch(
           new ModelDownloadError(
             'stalled',
             'The model download stopped making progress',
+            { asset: openModelRequests > 0 ? 'model' : 'runtime' },
           ),
         )
         return
@@ -181,7 +193,10 @@ export function createLoadWatch(
   const watchedFetch: Fetch = async (input, init) => {
     if (controller.signal.aborted) throw controller.signal.reason
     const url = urlOf(input)
+    const asset = options.assetOf?.(url) ?? 'model'
+    const isModel = asset === 'model'
     openRequests++
+    if (isModel) openModelRequests++
     touch()
     schedule()
     let response: Response
@@ -194,12 +209,14 @@ export function createLoadWatch(
       })
     } catch (error) {
       openRequests--
+      if (isModel) openModelRequests--
       touch()
       schedule()
       if (controller.signal.aborted) throw controller.signal.reason
       throw recordFailure(
         new ModelDownloadError('network', 'A model file could not be fetched', {
           cause: error,
+          asset,
         }),
       )
     }
@@ -209,6 +226,7 @@ export function createLoadWatch(
         new ModelDownloadError(
           'network',
           `The model host responded with ${response.status}`,
+          { asset },
         ),
       )
     }
@@ -220,6 +238,7 @@ export function createLoadWatch(
       response.type === 'opaque'
     ) {
       openRequests--
+      if (isModel) openModelRequests--
       schedule()
       return response
     }
@@ -241,6 +260,7 @@ export function createLoadWatch(
       open = false
       controller.signal.removeEventListener('abort', cancelOnAbort)
       openRequests--
+      if (isModel) openModelRequests--
       touch()
       schedule()
     }
@@ -268,6 +288,7 @@ export function createLoadWatch(
                 new ModelDownloadError(
                   'incomplete',
                   'The model download ended early',
+                  { asset },
                 ),
               )
               stream.error(error)
@@ -290,7 +311,7 @@ export function createLoadWatch(
               new ModelDownloadError(
                 'network',
                 'The model download was interrupted',
-                { cause: error },
+                { cause: error, asset },
               ),
             ),
           )

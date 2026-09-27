@@ -184,6 +184,42 @@ describe('model download watchdog', () => {
     watch.dispose()
   })
 
+  test('tags each failure with the kind of file that failed', async () => {
+    const { timers, advance } = fakeTimers()
+    const assetOf = (url: string) =>
+      url.includes('/models/') ? ('model' as const) : ('runtime' as const)
+    const offline = createLoadWatch(
+      async () => {
+        throw new TypeError('Failed to fetch')
+      },
+      { stallMs: 1000, startMs: 5000, assetOf, timers },
+    )
+    const runtime = await settledReason(
+      offline.fetch('https://cdn.test/ort.wasm'),
+    )
+    expect((runtime as ModelDownloadError).asset).toBe('runtime')
+    const model = await settledReason(
+      offline.fetch('https://x.test/models/a.onnx'),
+    )
+    expect((model as ModelDownloadError).asset).toBe('model')
+    offline.dispose()
+
+    const stalled = createLoadWatch(
+      async () => streamResponse([new Uint8Array(8)], { end: false }),
+      { stallMs: 1000, startMs: 5000, assetOf, timers },
+    )
+    const body = (
+      await stalled.fetch('https://cdn.test/ort.wasm')
+    ).arrayBuffer()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    await advance(1000)
+    const error = await settledReason(stalled.failed)
+    expect((error as ModelDownloadError).reason).toBe('stalled')
+    expect((error as ModelDownloadError).asset).toBe('runtime')
+    await settledReason(body)
+    stalled.dispose()
+  })
+
   test('unread error responses do not count as stalled downloads', async () => {
     const { timers, advance } = fakeTimers()
     const watch = createLoadWatch(

@@ -1119,11 +1119,11 @@ describe('Remover loading status', () => {
         view.getAllByText('Downloading model · 40 of 98 MB').length,
       ).toBeGreaterThan(0)
       expect(
-        view.getByText('First run only. Later runs use the saved model.'),
+        view.getByText('Usually a one-time download, so later runs are faster.'),
       ).toBeTruthy()
       const live = view.container.querySelector('[aria-live="polite"]')
       expect(live?.textContent).toBe(
-        'Downloading the model (98 MB). This happens once; later runs use the saved copy.',
+        'Downloading the model (98 MB). BG0 tries to keep it so later runs are faster.',
       )
 
       act(() =>
