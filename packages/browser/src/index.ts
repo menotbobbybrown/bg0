@@ -7,10 +7,10 @@ import {
 } from './cache'
 import {
   createLoadWatch,
+  type LoadWatch,
   ModelDownloadError,
   ModelStartTimeoutError,
   modelLoadTimings,
-  type LoadWatch,
 } from './download'
 import { BackgroundRemovalError, normalizeError } from './errors'
 import {
@@ -27,20 +27,20 @@ import {
   prepareImageForInference,
   validateImage,
 } from './image'
+import { clearIosModel, prepareIosModel, removeIosBackground } from './ios'
 import {
   detectEngineChoices,
+  type EngineChoice,
+  type ExecutionProvider,
   engineKey,
   FULL_MODEL,
   LITE_MODEL,
-  modelUrl,
-  type EngineChoice,
-  type ExecutionProvider,
   type ModelDefinition,
+  modelUrl,
   type RemovalModel,
 } from './models'
 import { createMaskRefinement, type InferenceMask } from './refinement'
 import { canUseOnnxWebGpu, shouldUseSingleThreadedWasm } from './runtime'
-import { clearIosModel, prepareIosModel, removeIosBackground } from './ios'
 
 function useIosModel() {
   return (
@@ -60,8 +60,8 @@ export {
 } from './image'
 
 export type RemovalQuality = 'fast' | 'quality'
-export { shouldUseSingleThreadedWasm as isIosBrowser } from './runtime'
 export type { ExecutionProvider, RemovalModel } from './models'
+export { shouldUseSingleThreadedWasm as isIosBrowser } from './runtime'
 
 export interface RemovalProgress {
   stage: 'preparing' | 'downloading' | 'processing' | 'finishing'
@@ -140,6 +140,8 @@ type EngineLoad = {
 const MODEL_CACHE_NAME = 'transformers-cache'
 const engineLoads = new Map<string, EngineLoad>()
 const failedEngines = new Set<string>()
+// Engines already retried once after their cached model was evicted as corrupt.
+const reloadedEngines = new Set<string>()
 let detectedChoices: Promise<EngineChoice[]> | undefined
 let webgpuUsableForSession = true
 
@@ -160,6 +162,7 @@ export function clearModelCache(): void {
   }
   engineLoads.clear()
   failedEngines.clear()
+  reloadedEngines.clear()
   detectedChoices = undefined
   webgpuUsableForSession = true
   modelCache = undefined
@@ -441,7 +444,9 @@ async function getPreferredEngine(
   const unreachableModels = new Set<string>()
   // Runtime files differ per provider, so their failure only skips that one.
   const unreachableProviders = new Set<ExecutionProvider>()
-  for (const choice of choices) {
+  const queue = [...choices]
+  for (let index = 0; index < queue.length; index += 1) {
+    const choice = queue[index]
     throwIfCancelled(signal)
     const key = engineKey(choice)
     if (
@@ -483,7 +488,15 @@ async function getPreferredEngine(
       if (isCorruptModelError(error)) {
         // A damaged cached file fails every later load until it is replaced.
         await evictCachedModel(choice.definition)
-        failedEngines.add(key)
+        throwIfCancelled(signal)
+        // Retry once with a fresh download: for lite WASM there is no later
+        // choice. A download that is corrupt again is not fetched a third time.
+        if (!reloadedEngines.has(key)) {
+          reloadedEngines.add(key)
+          queue.splice(index + 1, 0, choice)
+        } else {
+          failedEngines.add(key)
+        }
         continue
       }
       // Leave the final lite WASM path retryable after a transient error.

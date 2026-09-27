@@ -488,8 +488,59 @@ describe('model load recovery', () => {
       provider: 'webgpu',
     })
     expect(entries.has(modelFile(FULL_MODEL))).toBe(false)
-    expect(load).toHaveBeenCalledTimes(2)
+    // The full model is downloaded again once before falling back.
+    expect(load.mock.calls.map((call) => call[0])).toEqual([
+      FULL_MODEL.id,
+      FULL_MODEL.id,
+      LITE_MODEL.id,
+    ])
     expect(storage.size).toBe(0)
+  })
+
+  test('a corrupt lite WASM model is evicted and downloaded again once', async () => {
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: { userAgent: 'Firefox/150.0' },
+    })
+    const entries = installCaches(() => undefined)
+    entries.set(
+      modelFile(LITE_MODEL),
+      new Response('x', {
+        headers: { 'content-length': String(LITE_MODEL.bytes) },
+      }),
+    )
+    const corrupt = new Error(
+      "Can't create a session. ERROR_CODE: 7, ERROR_MESSAGE: Failed to load model because protobuf parsing failed.",
+    )
+    let corruptLoads = 1
+    const load = spyOn(AutoModel, 'from_pretrained').mockImplementation(
+      async () => {
+        if (corruptLoads > 0) {
+          corruptLoads -= 1
+          throw corrupt
+        }
+        return model('logits') as never
+      },
+    )
+    expect(await removeBackground(png)).toMatchObject({
+      model: 'birefnet-lite',
+      provider: 'wasm',
+    })
+    expect(entries.has(modelFile(LITE_MODEL))).toBe(false)
+    expect(load).toHaveBeenCalledTimes(2)
+
+    // A download that is corrupt every time is retried once, not forever.
+    clearModelCache()
+    corruptLoads = Number.POSITIVE_INFINITY
+    load.mockClear()
+    await expect(removeBackground(png)).rejects.toMatchObject({
+      code: 'model-load-failed',
+    })
+    expect(load).toHaveBeenCalledTimes(2)
+    await expect(removeBackground(png)).rejects.toMatchObject({
+      code: 'model-load-failed',
+    })
+    expect(load).toHaveBeenCalledTimes(2)
   })
 
   test('a cached model with the wrong size is ignored and removed', async () => {
