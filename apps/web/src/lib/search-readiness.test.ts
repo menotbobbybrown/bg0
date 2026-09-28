@@ -37,6 +37,13 @@ async function getPublicUrls(): Promise<string[]> {
 }
 
 describe('search crawler files', () => {
+  test('homepage is served by the app, not a static Markdown rewrite', async () => {
+    const config = await Bun.file('vercel.json').json()
+
+    expect(config.rewrites.some((rewrite: { source: string }) => rewrite.source === '/')).toBe(false)
+    expect(await Bun.file('public/index.md').exists()).toBe(true)
+  })
+
   test('sitemap lists every canonical public page once', async () => {
     const sitemap = await Bun.file('public/sitemap.xml').text()
     const locations = [...sitemap.matchAll(/<loc>(.*?)<\/loc>/g)].map(
