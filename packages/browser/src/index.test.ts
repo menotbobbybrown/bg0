@@ -544,6 +544,48 @@ describe('model load recovery', () => {
     expect(load).toHaveBeenCalledTimes(2)
   })
 
+  test('callers sharing a corrupt load both get the one retry', async () => {
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: { userAgent: 'Firefox/150.0' },
+    })
+    const entries = installCaches(() => undefined)
+    entries.set(
+      modelFile(LITE_MODEL),
+      new Response('x', {
+        headers: { 'content-length': String(LITE_MODEL.bytes) },
+      }),
+    )
+    const corrupt = new Error(
+      "Can't create a session. ERROR_CODE: 7, ERROR_MESSAGE: Failed to load model because protobuf parsing failed.",
+    )
+    // The first load fails only after both callers have joined it.
+    let failFirst: () => void = () => undefined
+    const firstLoad = new Promise<void>((resolve) => {
+      failFirst = resolve
+    })
+    let loads = 0
+    const load = spyOn(AutoModel, 'from_pretrained').mockImplementation(
+      async () => {
+        loads += 1
+        if (loads === 1) {
+          await firstLoad
+          throw corrupt
+        }
+        return model('logits') as never
+      },
+    )
+    const running = Promise.all([removeBackground(png), removeBackground(png)])
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(load).toHaveBeenCalledTimes(1)
+    failFirst()
+    const results = await running
+    for (const result of results) {
+      expect(result).toMatchObject({ model: 'birefnet-lite', provider: 'wasm' })
+    }
+    expect(load).toHaveBeenCalledTimes(2)
+  })
+
   test('a cached model with the wrong size is ignored and removed', async () => {
     const entries = installCaches(() => undefined)
     entries.set(

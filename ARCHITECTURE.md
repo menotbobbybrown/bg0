@@ -89,8 +89,10 @@ download that stops sending bytes for 30 seconds, a short body, or a network
 error marks that model file unreachable for the page and moves on without
 disabling WebGPU. A cached model that ONNX cannot parse is evicted before the
 next attempt. A GPU adapter that does not answer within 5 seconds counts as no
-GPU. If a model has not started after 150 seconds, loading stops with a
-retryable error instead of trying a heavier fallback on a struggling device.
+GPU. If loading goes 150 seconds with nothing downloading and no progress,
+for example while a model starts, it stops with a retryable error instead of
+trying a heavier fallback on a struggling device. Both limits are idle limits:
+a slow download that keeps delivering bytes is never cut off.
 
 A tab killed by the browser while the full model starts or runs leaves a marker
 in sessionStorage. The next attempt in that tab skips the full model, and the
