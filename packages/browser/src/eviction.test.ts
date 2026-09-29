@@ -59,10 +59,19 @@ describe('failure evictions', () => {
     expect(evict).toHaveBeenCalledTimes(2)
   })
 
-  test('a failure without a recorded copy always evicts', async () => {
+  test('a failure without a recorded copy never evicts', async () => {
     const { evict, evictions } = setup()
     await evictions.fail('lite', undefined)
+    expect(evict).toHaveBeenCalledTimes(0)
+  })
+
+  test('a failure without a recorded copy shares the eviction of the load it joined', async () => {
+    const { evict, evictions, copyOf } = setup()
+    const owner = evictions.fail('lite', copyOf('lite'))
+    expect(evictions.fail('lite', undefined)).toBe(owner)
+    await owner
+    // The retry has written a fresh copy; a late joined failure keeps it.
     await evictions.fail('lite', undefined)
-    expect(evict).toHaveBeenCalledTimes(2)
+    expect(evict).toHaveBeenCalledTimes(1)
   })
 })

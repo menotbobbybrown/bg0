@@ -94,10 +94,10 @@ afterEach(async () => {
 })
 
 /**
- * Opens the model file and reports load progress, which later callers of the
- * same load receive on joining.
+ * Reports that the load has opened its model file, as Transformers.js does
+ * once it has chosen between the cache and the network.
  */
-function reportLoadProgress(
+function openModelFile(
   id: string,
   options?: { progress_callback?: (event: never) => void },
 ) {
@@ -106,6 +106,17 @@ function reportLoadProgress(
     name: id,
     file: 'onnx/model_fp16.onnx',
   } as never)
+}
+
+/**
+ * Opens the model file and reports load progress, which later callers of the
+ * same load receive on joining.
+ */
+function reportLoadProgress(
+  id: string,
+  options?: { progress_callback?: (event: never) => void },
+) {
+  openModelFile(id, options)
   options?.progress_callback?.({
     status: 'progress',
     name: id,
@@ -520,7 +531,8 @@ describe('model load recovery', () => {
       }),
     )
     const load = spyOn(AutoModel, 'from_pretrained').mockImplementation(
-      async (id) => {
+      async (id, options) => {
+        openModelFile(id, options)
         if (id === FULL_MODEL.id) {
           throw new Error(
             "Can't create a session. ERROR_CODE: 7, ERROR_MESSAGE: Failed to load model because protobuf parsing failed.",
@@ -560,7 +572,8 @@ describe('model load recovery', () => {
     )
     let corruptLoads = 1
     const load = spyOn(AutoModel, 'from_pretrained').mockImplementation(
-      async () => {
+      async (id, options) => {
+        openModelFile(id, options)
         if (corruptLoads > 0) {
           corruptLoads -= 1
           throw corrupt
@@ -604,22 +617,25 @@ describe('model load recovery', () => {
     const corrupt = new Error(
       "Can't create a session. ERROR_CODE: 7, ERROR_MESSAGE: Failed to load model because protobuf parsing failed.",
     )
-    spyOn(AutoModel, 'from_pretrained').mockImplementation(async () => {
-      if (!entries.has(modelFile(LITE_MODEL))) {
-        // The retry downloads and caches a file that is corrupt too.
-        const cache = env.customCache as {
-          put: (key: string, response: Response) => Promise<void>
+    spyOn(AutoModel, 'from_pretrained').mockImplementation(
+      async (id, options) => {
+        openModelFile(id, options)
+        if (!entries.has(modelFile(LITE_MODEL))) {
+          // The retry downloads and caches a file that is corrupt too.
+          const cache = env.customCache as {
+            put: (key: string, response: Response) => Promise<void>
+          }
+          await cache.put(
+            modelFile(LITE_MODEL),
+            new Response('y', {
+              headers: { 'content-length': String(LITE_MODEL.bytes) },
+            }),
+          )
+          await new Promise((resolve) => setTimeout(resolve, 0))
         }
-        await cache.put(
-          modelFile(LITE_MODEL),
-          new Response('y', {
-            headers: { 'content-length': String(LITE_MODEL.bytes) },
-          }),
-        )
-        await new Promise((resolve) => setTimeout(resolve, 0))
-      }
-      throw corrupt
-    })
+        throw corrupt
+      },
+    )
     await expect(removeBackground(png)).rejects.toMatchObject({
       code: 'model-load-failed',
     })

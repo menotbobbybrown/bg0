@@ -138,7 +138,8 @@ type EngineLoad = {
   retired: boolean
   /**
    * The cached copy of the model this load read, for eviction. Unset until
-   * the load has opened its model file.
+   * the load has opened its model file, and left unset when the load joined
+   * another load's read of the file; that load evicts the copy instead.
    */
   copy?: number
   disposal?: Promise<void>

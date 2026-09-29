@@ -282,4 +282,31 @@ describe('safe model cache', () => {
     await failures.fail(url, copy)
     expect(entries.has(url)).toBe(true)
   })
+
+  test('a load that joined another read keeps the retry', async () => {
+    const entries = new Map<string, Response>([[url, sized(4)]])
+    const cache = createSafeCache(async () => ({
+      match: async (key) => entries.get(String(key)),
+      put: async (key, response) => {
+        entries.set(String(key), response)
+      },
+      delete: async (key) => entries.delete(String(key)),
+    }))
+    const failures = createFailureEvictions(
+      async (key: string) => {
+        await cache.delete(key)
+      },
+      (key) => key,
+      (key) => cache.copy(key),
+    )
+    // The load that read the damaged file fails and evicts it.
+    await cache.match(url)
+    await failures.fail(url, cache.copyLastRead(url))
+    // The retry caches a fresh download, then a load that joined the first
+    // read, and so never learned which copy it got, fails too.
+    await cache.put(url, sized(4))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    await failures.fail(url, undefined)
+    expect(entries.has(url)).toBe(true)
+  })
 })
