@@ -36,6 +36,7 @@ type GuardLocks = Pick<LockManager, 'request' | 'query'>
 let running = 0
 let markerId = ''
 let releaseLock: (() => void) | undefined
+let markerCheck: Promise<boolean> | undefined
 let stopWatchingPage: (() => void) | undefined
 
 function session(): Storage | undefined {
@@ -100,6 +101,32 @@ function holdLock(locks: GuardLocks | undefined, id: string): void {
   }
 }
 
+/**
+ * Decide whether a marker was left by a crash. Concurrent callers share one
+ * decision, and the marker stays in place until it is made, so no caller can
+ * miss it while the lock query is pending.
+ */
+function checkMarker(
+  marker: string,
+  now: number,
+  locks: GuardLocks | undefined,
+): Promise<boolean> {
+  const check = (async () => {
+    const crashed = !(await lockIsHeld(locks, marker))
+    try {
+      session()?.removeItem(RUNNING_KEY)
+    } catch {
+      // The block below still applies.
+    }
+    if (crashed) blockFullModel(now)
+    return crashed
+  })().finally(() => {
+    markerCheck = undefined
+  })
+  markerCheck = check
+  return check
+}
+
 /** Skip the full model on this device for a week. */
 export function blockFullModel(now = Date.now()): void {
   try {
@@ -118,13 +145,12 @@ export async function isFullModelBlocked(
   locks = webLocks(),
 ): Promise<boolean> {
   try {
-    const marker = running === 0 ? session()?.getItem(RUNNING_KEY) : undefined
-    if (marker) {
-      session()?.removeItem(RUNNING_KEY)
-      if (!(await lockIsHeld(locks, marker))) {
-        blockFullModel(now)
-        return true
-      }
+    if (markerCheck) {
+      if (await markerCheck) return true
+    } else {
+      const marker =
+        running === 0 ? session()?.getItem(RUNNING_KEY) : undefined
+      if (marker && (await checkMarker(marker, now, locks))) return true
     }
     const stored = local()?.getItem(BLOCKED_KEY)
     if (stored === null || stored === undefined) return false

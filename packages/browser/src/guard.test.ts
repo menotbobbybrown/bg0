@@ -145,4 +145,27 @@ describe('full model guard', () => {
     session.set('bg0:full-model-running:v1', String(marker))
     expect(await isFullModelBlocked(1000, locks)).toBe(true)
   })
+
+  test('concurrent checks agree while the lock query is pending', async () => {
+    const { locks } = fakeLocks()
+    let answer: () => void = () => undefined
+    const slowLocks = {
+      ...locks,
+      query: async () => {
+        await new Promise<void>((resolve) => {
+          answer = resolve
+        })
+        return locks.query()
+      },
+    } as typeof locks
+    session.set('bg0:full-model-running:v1', 'crashed-run')
+    const first = isFullModelBlocked(1000, slowLocks)
+    const second = isFullModelBlocked(1000, slowLocks)
+    // The marker is kept until the decision is made.
+    expect(session.size).toBe(1)
+    answer()
+    expect(await Promise.all([first, second])).toEqual([true, true])
+    expect(session.size).toBe(0)
+    expect(await isFullModelBlocked(1000, slowLocks)).toBe(true)
+  })
 })
