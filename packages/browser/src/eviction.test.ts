@@ -2,14 +2,22 @@ import { describe, expect, mock, test } from 'bun:test'
 import { createFailureEvictions } from './eviction'
 
 function setup() {
-  const evict = mock(async (_target: string) => undefined)
-  return { evict, evictions: createFailureEvictions(evict, (t) => t) }
+  const copies = new Map<string, number>()
+  const copyOf = (target: string) => copies.get(target) ?? 0
+  const evict = mock(async (target: string) => {
+    copies.set(target, copyOf(target) + 1)
+  })
+  return {
+    evict,
+    copyOf,
+    evictions: createFailureEvictions(evict, (t) => t, copyOf),
+  }
 }
 
 describe('failure evictions', () => {
   test('failures of one copy evict it once', async () => {
-    const { evict, evictions } = setup()
-    const copy = evictions.begin('lite')
+    const { evict, evictions, copyOf } = setup()
+    const copy = copyOf('lite')
     await evictions.fail('lite', copy)
     // The retry is now writing a fresh download.
     await evictions.fail('lite', copy)
@@ -17,35 +25,53 @@ describe('failure evictions', () => {
   })
 
   test('loads that read the same copy share its eviction', async () => {
-    const { evict, evictions } = setup()
-    const webgpu = evictions.begin('lite')
-    const wasm = evictions.begin('lite')
+    const { evict, evictions, copyOf } = setup()
+    const webgpu = copyOf('lite')
+    const wasm = copyOf('lite')
     const first = evictions.fail('lite', webgpu)
     expect(evictions.fail('lite', wasm)).toBe(first)
     await first
     expect(evict).toHaveBeenCalledTimes(1)
   })
 
-  test('a load that began after an eviction evicts again', async () => {
-    const { evict, evictions } = setup()
-    await evictions.fail('lite', evictions.begin('lite'))
-    await evictions.fail('lite', evictions.begin('lite'))
+  test('a load that read a copy after an eviction evicts again', async () => {
+    const { evict, evictions, copyOf } = setup()
+    await evictions.fail('lite', copyOf('lite'))
+    await evictions.fail('lite', copyOf('lite'))
     expect(evict).toHaveBeenCalledTimes(2)
   })
 
+  test('a copy evicted for another reason is not evicted again', async () => {
+    const { evict, evictions, copyOf } = setup()
+    const copy = copyOf('lite')
+    // For example, the cache dropped it for having the wrong size.
+    await evict('lite')
+    await evictions.fail('lite', copy)
+    expect(evict).toHaveBeenCalledTimes(1)
+  })
+
   test('copies are tracked per file', async () => {
-    const { evict, evictions } = setup()
-    const lite = evictions.begin('lite')
-    const full = evictions.begin('full')
+    const { evict, evictions, copyOf } = setup()
+    const lite = copyOf('lite')
+    const full = copyOf('full')
     await evictions.fail('lite', lite)
     await evictions.fail('full', full)
     expect(evict).toHaveBeenCalledTimes(2)
   })
 
-  test('a failure without a recorded copy always evicts', async () => {
+  test('a failure without a recorded copy never evicts', async () => {
     const { evict, evictions } = setup()
     await evictions.fail('lite', undefined)
+    expect(evict).toHaveBeenCalledTimes(0)
+  })
+
+  test('a failure without a recorded copy shares the eviction of the load it joined', async () => {
+    const { evict, evictions, copyOf } = setup()
+    const owner = evictions.fail('lite', copyOf('lite'))
+    expect(evictions.fail('lite', undefined)).toBe(owner)
+    await owner
+    // The retry has written a fresh copy; a late joined failure keeps it.
     await evictions.fail('lite', undefined)
-    expect(evict).toHaveBeenCalledTimes(2)
+    expect(evict).toHaveBeenCalledTimes(1)
   })
 })
