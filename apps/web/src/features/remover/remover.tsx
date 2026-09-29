@@ -17,6 +17,7 @@ import {
   Copy,
   Download,
   FolderOpen,
+  ImagePlus,
   RotateCcw,
   TriangleAlert,
   X,
@@ -195,6 +196,14 @@ export function Remover({
   const [failedPreviewUrl, setFailedPreviewUrl] = useState<string>()
   const pickerRef = useRef<HTMLDivElement>(null)
   const [pickerOffscreen, setPickerOffscreen] = useState(false)
+  // Whether the current result was downloaded or copied. A new image may still
+  // replace an unsaved result, but the replacement is never silent.
+  const resultSavedRef = useRef(false)
+  const [resultSaved, setResultSavedState] = useState(false)
+  const setResultSaved = useCallback((saved: boolean) => {
+    resultSavedRef.current = saved
+    setResultSavedState(saved)
+  }, [])
 
   useEffect(() => {
     setShowIosExportNotice(
@@ -236,13 +245,22 @@ export function Remover({
       if (emitAnalytics) captureImageSelected(inputMethod)
       const startedAt = performance.now()
 
+      const replacing = latestState.current.status === 'result'
+      const replacingUnsaved = replacing && !resultSavedRef.current
+      // Replacing a result directly starts another image, like Start over.
+      if (replacing && emitAnalytics) captureFeatureUsed('start_another_image')
       abortController.current?.abort()
       cleanupUrls(latestState.current)
       const sourceUrl = URL.createObjectURL(file)
       const controller = new AbortController()
       abortController.current = controller
       setView('compare')
-      setAnnouncement('Removing background on this device.')
+      if (replacingUnsaved) notify('Previous result replaced before download')
+      setAnnouncement(
+        replacing
+          ? `${replacingUnsaved ? 'Previous result replaced before download. ' : ''}Removing the background from the new image on this device.`
+          : 'Removing background on this device.',
+      )
       commitState({
         status: 'processing',
         sourceUrl,
@@ -300,6 +318,7 @@ export function Remover({
           throw error
         }
         if (previewSourceUrl !== sourceUrl) URL.revokeObjectURL(sourceUrl)
+        setResultSaved(false)
         commitState({
           status: 'result',
           sourceUrl: previewSourceUrl,
@@ -349,7 +368,13 @@ export function Remover({
         }
       }
     },
-    [commitState, removeBackgroundImpl, waitForPaintImpl],
+    [
+      commitState,
+      notify,
+      removeBackgroundImpl,
+      setResultSaved,
+      waitForPaintImpl,
+    ],
   )
 
   const selectFiles = useCallback(
@@ -385,9 +410,10 @@ export function Remover({
     link.href = current.resultUrl
     link.download = `${current.name}-bg0.png`
     link.click()
+    setResultSaved(true)
     notify('PNG downloaded')
     captureResultDownloaded(current.result.provider)
-  }, [notify])
+  }, [notify, setResultSaved])
 
   const copyResult = useCallback(async () => {
     const current = latestState.current
@@ -407,14 +433,21 @@ export function Remover({
         navigator.clipboard.write([new ClipboardItem({ 'image/png': png })]),
         CLIPBOARD_TIMEOUT_MS,
       )
-      setCopied(true)
-      notify('PNG copied to the clipboard')
+      // A new image may have replaced this result while the write was
+      // pending. The clipboard holds the old PNG, so the new one stays unsaved.
+      const shown = latestState.current
+      // Announcing it then would also replace the new image's status.
+      if (shown.status === 'result' && shown.resultUrl === current.resultUrl) {
+        setCopied(true)
+        setResultSaved(true)
+        window.setTimeout(() => setCopied(false), 1600)
+        notify('PNG copied to the clipboard')
+      }
       captureFeatureUsed('copy_result')
-      window.setTimeout(() => setCopied(false), 1600)
     } catch {
       notify('Clipboard blocked by the browser. Download instead.', 'error')
     }
-  }, [notify])
+  }, [notify, setResultSaved])
 
   const pasteFromClipboard = useCallback(async () => {
     try {
@@ -793,6 +826,17 @@ export function Remover({
                 </Button>
                 <Button
                   type="button"
+                  variant="ghost"
+                  onClick={openFilePicker}
+                  data-testid="choose-new-image"
+                  className="w-9 px-0 sm:w-auto sm:px-4"
+                >
+                  <ImagePlus aria-hidden="true" />
+                  <span className="sr-only sm:not-sr-only">New image</span>
+                  <Kbd className="hidden sm:inline-flex">⌘O</Kbd>
+                </Button>
+                <Button
+                  type="button"
                   variant="secondary"
                   onClick={() => void copyResult()}
                   data-testid="copy-result"
@@ -852,6 +896,31 @@ export function Remover({
                 Choose another image
               </Button>
             </div>
+          </div>
+        )}
+
+        {state.status !== 'idle' && (
+          <div
+            aria-hidden={!isDragging}
+            data-testid="replace-drop-overlay"
+            data-visible={isDragging}
+            className={cn(
+              'pointer-events-none absolute inset-0 z-30 flex flex-col items-center justify-center gap-1.5 bg-background/80 p-6 text-center opacity-0 backdrop-blur-sm transition-opacity duration-(--duration-quick) ease-(--ease-out) motion-reduce:transition-none',
+              isDragging && 'opacity-100',
+            )}
+          >
+            <div className="pointer-events-none absolute inset-3 rounded-[10px] border border-dashed border-wipe" />
+            <ImagePlus className="size-6 text-wipe" />
+            <p className="text-base font-medium">
+              Release to remove the background
+            </p>
+            {state.status === 'result' && (
+              <p className="text-[13px] text-muted-foreground">
+                {resultSaved
+                  ? 'This replaces the current result.'
+                  : 'This replaces the current result, which has not been downloaded.'}
+              </p>
+            )}
           </div>
         )}
       </div>

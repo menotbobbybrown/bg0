@@ -2,6 +2,7 @@ import { afterAll, afterEach, describe, expect, mock, test } from 'bun:test'
 import { GlobalRegistrator } from '@happy-dom/global-registrator'
 
 const imageSelectedCalls: string[] = []
+const featureCalls: string[] = []
 
 mock.module('#/lib/analytics', () => ({
   capturePageView: () => {},
@@ -12,7 +13,9 @@ mock.module('#/lib/analytics', () => ({
   showResultSurvey: () => {},
   captureRemovalFailed: () => {},
   captureResultDownloaded: () => {},
-  captureFeatureUsed: () => {},
+  captureFeatureUsed: (feature: string) => {
+    featureCalls.push(feature)
+  },
   captureAppException: () => {},
 }))
 
@@ -39,6 +42,7 @@ globalThis.IntersectionObserver =
 afterEach(() => {
   cleanup()
   imageSelectedCalls.length = 0
+  featureCalls.length = 0
 })
 
 afterAll(async () => {
@@ -137,6 +141,45 @@ describe('Remover retry analytics', () => {
         expect(remove).toHaveBeenCalledTimes(2)
       })
       expect(imageSelectedCalls).toEqual(['picker', 'picker'])
+      // Start over already counted it; the next pick must not count again.
+      expect(featureCalls).toEqual(['start_another_image'])
+    } finally {
+      view.unmount()
+    }
+  })
+
+  test('drops and pastes on the result screen report their input method', async () => {
+    const remove = mock(() => Promise.resolve(resultWithSource()))
+    const view = render(
+      <Remover
+        removeBackgroundImpl={remove}
+        waitForPaintImpl={async () => {}}
+      />,
+    )
+
+    try {
+      selectFile(view, new File(['one'], 'one.png', { type: 'image/png' }))
+      await waitFor(() => {
+        expect(view.getByRole('button', { name: /Download PNG/ })).toBeTruthy()
+      })
+
+      const dropped = new DataTransfer()
+      dropped.items.add(new File(['two'], 'two.png', { type: 'image/png' }))
+      fireEvent.drop(window, { dataTransfer: dropped })
+      await waitFor(() => expect(remove).toHaveBeenCalledTimes(2))
+      await waitFor(() => {
+        expect(view.getByRole('button', { name: /Download PNG/ })).toBeTruthy()
+      })
+
+      const pasted = new DataTransfer()
+      pasted.items.add(new File(['three'], 'clip.png', { type: 'image/png' }))
+      fireEvent.paste(window, { clipboardData: pasted })
+      await waitFor(() => expect(remove).toHaveBeenCalledTimes(3))
+      expect(imageSelectedCalls).toEqual(['picker', 'drop', 'paste'])
+      expect(featureCalls).toEqual([
+        'start_another_image',
+        'start_another_image',
+      ])
     } finally {
       view.unmount()
     }

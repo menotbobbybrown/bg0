@@ -633,6 +633,204 @@ describe('Remover image drops', () => {
   )
 })
 
+describe('Remover result screen', () => {
+  async function renderWithResult() {
+    const urls = trackObjectUrls()
+    const requests: ReturnType<typeof deferred<BackgroundRemovalResult>>[] = []
+    const remove = mock((_input: Blob, _options?: RemoveBackgroundOptions) => {
+      const request = deferred<BackgroundRemovalResult>()
+      requests.push(request)
+      return request.promise
+    })
+    const view = render(
+      <Remover
+        removeBackgroundImpl={remove}
+        waitForPaintImpl={() => Promise.resolve()}
+      />,
+    )
+    selectFile(view, new File(['one'], 'one.png', { type: 'image/png' }))
+    await waitFor(() => expect(remove).toHaveBeenCalledTimes(1))
+    await act(async () => requests[0]?.resolve(resultWithSource()))
+    await waitFor(() => {
+      expect(view.getByRole('button', { name: /Download PNG/ })).toBeTruthy()
+    })
+    // blob:test-1 is the picked file (released once the decoded source
+    // exists), blob:test-2 the result, and blob:test-3 the preview source.
+    expect(urls.revoked).toEqual(['blob:test-1'])
+    return { urls, remove, requests, view }
+  }
+
+  function liveRegion(view: ReturnType<typeof render>) {
+    return view.container.querySelector('[aria-live="polite"]')?.textContent
+  }
+
+  test('shows a replace affordance while dragging and processes a dropped image', async () => {
+    const { urls, remove, requests, view } = await renderWithResult()
+    try {
+      const overlay = view.getByTestId('replace-drop-overlay')
+      expect(overlay.getAttribute('aria-hidden')).toBe('true')
+      expect(overlay.getAttribute('data-visible')).toBe('false')
+
+      const file = new File(['two'], 'two.png', { type: 'image/png' })
+      const transfer = new DataTransfer()
+      transfer.items.add(file)
+      expect(fireEvent.dragEnter(window, { dataTransfer: transfer })).toBe(
+        false,
+      )
+      expect(overlay.getAttribute('data-visible')).toBe('true')
+      // Screen readers can read the replacement warning while it is shown.
+      expect(overlay.getAttribute('aria-hidden')).toBe('false')
+      expect(overlay.textContent).toContain('Release to remove the background')
+      expect(overlay.textContent).toContain('has not been downloaded')
+
+      expect(fireEvent.drop(window, { dataTransfer: transfer })).toBe(false)
+      expect(overlay.getAttribute('data-visible')).toBe('false')
+      await waitFor(() => expect(remove).toHaveBeenCalledTimes(2))
+      expect(remove.mock.calls[1]?.[0]).toBe(file)
+      expect(
+        view.getByRole('img', { name: 'Original being processed' }),
+      ).toBeTruthy()
+      // The previous result and its preview source are released immediately.
+      expect(urls.revoked).toEqual([
+        'blob:test-1',
+        'blob:test-3',
+        'blob:test-2',
+      ])
+      expect(liveRegion(view)).toBe(
+        'Previous result replaced before download. Removing the background from the new image on this device.',
+      )
+      expect(
+        view.getByText('Previous result replaced before download'),
+      ).toBeTruthy()
+
+      await act(async () => requests[1]?.resolve(resultWithSource()))
+      await waitFor(() => {
+        expect(view.getByRole('button', { name: /Download PNG/ })).toBeTruthy()
+      })
+      expect(view.getByAltText('Background removed').getAttribute('src')).toBe(
+        'blob:test-5',
+      )
+    } finally {
+      view.unmount()
+      urls.restore()
+    }
+  })
+
+  test('replaces a downloaded result from a paste without a warning', async () => {
+    const { urls, remove, view } = await renderWithResult()
+    const click = mock(() => {})
+    const originalClick = HTMLAnchorElement.prototype.click
+    HTMLAnchorElement.prototype.click = click
+    try {
+      fireEvent.click(view.getByRole('button', { name: /Download PNG/ }))
+      expect(click).toHaveBeenCalledTimes(1)
+
+      const transfer = new DataTransfer()
+      transfer.items.add(new File(['two'], 'two.png', { type: 'image/png' }))
+      fireEvent.dragEnter(window, { dataTransfer: transfer })
+      expect(view.getByTestId('replace-drop-overlay').textContent).toContain(
+        'This replaces the current result.',
+      )
+      fireEvent.dragLeave(window, { dataTransfer: transfer })
+
+      const pasted = new DataTransfer()
+      pasted.items.add(
+        new File(['three'], 'clipboard.png', { type: 'image/png' }),
+      )
+      fireEvent.paste(window, { clipboardData: pasted })
+      await waitFor(() => expect(remove).toHaveBeenCalledTimes(2))
+      expect(liveRegion(view)).toBe(
+        'Removing the background from the new image on this device.',
+      )
+      expect(
+        view.queryByText('Previous result replaced before download'),
+      ).toBeNull()
+      expect(urls.revoked).toEqual([
+        'blob:test-1',
+        'blob:test-3',
+        'blob:test-2',
+      ])
+    } finally {
+      HTMLAnchorElement.prototype.click = originalClick
+      view.unmount()
+      urls.restore()
+    }
+  })
+
+  test('a copy that finishes after a replacement leaves the new result unsaved', async () => {
+    const { urls, remove, requests, view } = await renderWithResult()
+    const write = deferred<void>()
+    const secure = Object.getOwnPropertyDescriptor(window, 'isSecureContext')
+    const clipboard = Object.getOwnPropertyDescriptor(navigator, 'clipboard')
+    const originalClipboardItem = globalThis.ClipboardItem
+    Object.defineProperty(window, 'isSecureContext', {
+      configurable: true,
+      value: true,
+    })
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { write: () => write.promise },
+    })
+    globalThis.ClipboardItem = class {
+      constructor(readonly items: Record<string, Blob>) {}
+    } as unknown as typeof ClipboardItem
+    try {
+      fireEvent.click(view.getByRole('button', { name: /^Copy/ }))
+      selectFile(view, new File(['two'], 'two.png', { type: 'image/png' }))
+      await waitFor(() => expect(remove).toHaveBeenCalledTimes(2))
+      await act(async () => requests[1]?.resolve(resultWithSource()))
+      await waitFor(() => {
+        expect(view.getByRole('button', { name: /Download PNG/ })).toBeTruthy()
+      })
+      await act(async () => write.resolve())
+      expect(
+        view.getByRole('button', { name: /^Copy/ }).textContent,
+      ).not.toContain('Copied')
+      expect(view.queryByText('PNG copied to the clipboard')).toBeNull()
+
+      selectFile(view, new File(['three'], 'three.png', { type: 'image/png' }))
+      await waitFor(() => expect(remove).toHaveBeenCalledTimes(3))
+      expect(liveRegion(view)).toBe(
+        'Previous result replaced before download. Removing the background from the new image on this device.',
+      )
+    } finally {
+      if (secure) Object.defineProperty(window, 'isSecureContext', secure)
+      else delete (window as { isSecureContext?: boolean }).isSecureContext
+      if (clipboard) Object.defineProperty(navigator, 'clipboard', clipboard)
+      else delete (navigator as { clipboard?: Clipboard }).clipboard
+      globalThis.ClipboardItem = originalClipboardItem
+      view.unmount()
+      urls.restore()
+    }
+  })
+
+  test('opens the file picker from the result screen in one click', async () => {
+    const { urls, remove, view } = await renderWithResult()
+    try {
+      const fileInput = view.getByLabelText(
+        'Choose an image file to remove its background',
+      )
+      const fileClick = mock(() => {})
+      fileInput.click = fileClick
+
+      const button = view.getByRole('button', { name: /^New image/ })
+      fireEvent.click(button)
+      expect(fileClick).toHaveBeenCalledTimes(1)
+      // Cancelling the picker keeps the current result.
+      expect(view.getByRole('button', { name: /Download PNG/ })).toBeTruthy()
+
+      selectFile(view, new File(['two'], 'two.png', { type: 'image/png' }))
+      await waitFor(() => expect(remove).toHaveBeenCalledTimes(2))
+      expect(
+        view.getByRole('img', { name: 'Original being processed' }),
+      ).toBeTruthy()
+    } finally {
+      view.unmount()
+      urls.restore()
+    }
+  })
+})
+
 describe('Remover retry', () => {
   test.each([
     ['inference-failed', true],
