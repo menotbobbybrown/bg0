@@ -242,17 +242,19 @@ describe('safe model cache', () => {
       },
       delete: async (key) => entries.delete(String(key)),
     }))
+    const first = cache.copy(url)
     expect(await cache.match(url)).toBeInstanceOf(Response)
     await cache.delete(url)
     // The read returned the copy that was then evicted.
-    expect(cache.copy(url)).toBe(1)
-    expect(cache.copyLastRead(url)).toBe(0)
+    const second = cache.copy(url)
+    expect(second).not.toBe(first)
+    expect(cache.copyLastRead(url)).toBe(first)
     // Checking the cache is not a load's read.
     await cache.has(url)
-    expect(cache.copyLastRead(url)).toBe(0)
+    expect(cache.copyLastRead(url)).toBe(first)
     // A miss is followed by a download written after every eviction so far.
     expect(await cache.match(url)).toBeUndefined()
-    expect(cache.copyLastRead(url)).toBe(1)
+    expect(cache.copyLastRead(url)).toBe(second)
   })
 
   test('a load evicted between its read and its failure keeps the retry', async () => {
@@ -273,8 +275,9 @@ describe('safe model cache', () => {
     )
     // One load reads the damaged file, but before it records which copy it
     // read, another load that read the same file fails and evicts it.
+    const damaged = cache.copy(url)
     await cache.match(url)
-    await failures.fail(url, 0)
+    await failures.fail(url, damaged)
     const copy = cache.copyLastRead(url)
     // The retry caches a fresh download, then the first load fails too.
     await cache.put(url, sized(4))
@@ -307,6 +310,33 @@ describe('safe model cache', () => {
     await cache.put(url, sized(4))
     await new Promise((resolve) => setTimeout(resolve, 0))
     await failures.fail(url, undefined)
+    expect(entries.has(url)).toBe(true)
+  })
+
+  test('copies of a replaced cache never match the new cache', async () => {
+    const entries = new Map<string, Response>([[url, sized(4)]])
+    const open = async () => ({
+      match: async (key: RequestInfo | URL) => entries.get(String(key)),
+      put: async (key: RequestInfo | URL, response: Response) => {
+        entries.set(String(key), response)
+      },
+      delete: async (key: RequestInfo | URL) => entries.delete(String(key)),
+    })
+    const old = createSafeCache(open)
+    await old.match(url)
+    const copy = old.copyLastRead(url)
+    // The model cache is reset, and a new cache serves a healthy file.
+    const current = createSafeCache(open)
+    const failures = createFailureEvictions(
+      async (key: string) => {
+        await current.delete(key)
+      },
+      (key) => key,
+      (key) => current.copy(key),
+    )
+    await current.match(url)
+    // A load that read through the old cache fails late.
+    await failures.fail(url, copy)
     expect(entries.has(url)).toBe(true)
   })
 })

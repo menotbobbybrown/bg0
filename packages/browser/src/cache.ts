@@ -226,6 +226,12 @@ async function settlesWithin(
   }
 }
 
+let copyCount = 0
+const nextCopy = () => {
+  copyCount += 1
+  return copyCount
+}
+
 /**
  * Make a cache safe to hand to transformers.js.
  *
@@ -244,7 +250,8 @@ async function settlesWithin(
  * starts meanwhile cannot read the rejected file. A read that was already in
  * flight when the eviction began also returns a miss. Each eviction starts a
  * new copy of the key, and the cache remembers which copy each read returned,
- * so a load that fails can tell whether the file it read is still cached. A model can also be rejected
+ * so a load that fails can tell whether the file it read is still cached,
+ * even after the cache itself was replaced. A model can also be rejected
  * before its own background write lands, so eviction also waits for every
  * write already in flight to settle and then deletes again: a late write
  * cannot restore the evicted file. A write that starts during an eviction is
@@ -264,9 +271,12 @@ export function createSafeCache(
   }
   const writes = new Map<string, Set<Promise<void>>>()
   const evicting = new Map<string, Promise<unknown>>()
-  // Each eviction starts a new copy of its key.
+  // Each eviction starts a new copy of its key. Copy numbers are unique
+  // across cache instances, so a load that read through a cache that has
+  // since been replaced never matches a copy of the new one.
+  const firstCopy = nextCopy()
   const copies = new Map<string, number>()
-  const copyOf = (key: string) => copies.get(key) ?? 0
+  const copyOf = (key: string) => copies.get(key) ?? firstCopy
   // The copy that the latest recorded read of each key returned.
   const hits = new Map<string, number>()
   const remove = async (input: RequestInfo | URL) => {
@@ -278,7 +288,7 @@ export function createSafeCache(
   }
   const evict = (input: RequestInfo | URL) => {
     const key = keyOf(input)
-    copies.set(key, copyOf(key) + 1)
+    copies.set(key, nextCopy())
     const removed = remove(input)
     const pending = writes.get(key)
     const settled = Promise.all([
