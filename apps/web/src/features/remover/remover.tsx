@@ -1084,7 +1084,7 @@ function progressNote(progress: RemovalProgress, ios: boolean) {
   }
   // iPhone and iPad already show their own notice about the lighter model.
   if (progress.provider === 'wasm' && !ios) {
-    return 'No GPU acceleration in this browser, so this can take a minute.'
+    return 'Running without GPU acceleration, so this can take a minute.'
   }
   return undefined
 }

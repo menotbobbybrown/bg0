@@ -69,7 +69,9 @@ describe('iOS export notice', () => {
 
   test('does not warm the model when saveData or slow connection is active', () => {
     const prepare = mock(() => Promise.resolve('wasm' as const))
-    const originalConnection = (navigator as Navigator & { connection?: unknown }).connection
+    const originalConnection = (
+      navigator as Navigator & { connection?: unknown }
+    ).connection
 
     try {
       Object.defineProperty(navigator, 'connection', {
@@ -1119,7 +1121,9 @@ describe('Remover loading status', () => {
         view.getAllByText('Downloading model · 40 of 98 MB').length,
       ).toBeGreaterThan(0)
       expect(
-        view.getByText('Usually a one-time download, so later runs are faster.'),
+        view.getByText(
+          'Usually a one-time download, so later runs are faster.',
+        ),
       ).toBeTruthy()
       const live = view.container.querySelector('[aria-live="polite"]')
       expect(live?.textContent).toBe(
@@ -1149,7 +1153,7 @@ describe('Remover loading status', () => {
       )
       expect(
         view.getByText(
-          'No GPU acceleration in this browser, so this can take a minute.',
+          'Running without GPU acceleration, so this can take a minute.',
         ),
       ).toBeTruthy()
 
@@ -1161,7 +1165,7 @@ describe('Remover loading status', () => {
           provider: 'webgpu',
         }),
       )
-      expect(view.queryByText(/No GPU acceleration/)).toBeNull()
+      expect(view.queryByText(/without GPU acceleration/)).toBeNull()
     } finally {
       view.unmount()
       urls.restore()
