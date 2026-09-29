@@ -667,9 +667,15 @@ async function getEngine(
     load = currentLoad
     engineLoads.set(key, load)
     // A failed load must not be reused, even when every caller cancelled
-    // before it settled and nobody is left to evict it.
-    promise.catch(() => {
+    // before it settled.
+    promise.catch((error) => {
       if (engineLoads.get(key) === currentLoad) engineLoads.delete(key)
+      // The load evicts a damaged copy it read even when every caller has
+      // cancelled: loads that joined its read cannot evict it themselves.
+      // A caller still waiting shares this eviction.
+      if (isCorruptModelError(error)) {
+        void corruptModels.fail(choice.definition, currentLoad.copy)
+      }
     })
   }
 

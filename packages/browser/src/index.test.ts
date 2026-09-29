@@ -695,6 +695,112 @@ describe('model load recovery', () => {
     ).toHaveLength(1)
   })
 
+  test('a corrupt load evicts its copy after every caller cancelled', async () => {
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: { userAgent: 'Firefox/150.0' },
+    })
+    const entries = installCaches(() => undefined)
+    entries.set(
+      modelFile(LITE_MODEL),
+      new Response('x', {
+        headers: { 'content-length': String(LITE_MODEL.bytes) },
+      }),
+    )
+    let failFirst: () => void = () => undefined
+    const firstLoad = new Promise<void>((resolve) => {
+      failFirst = resolve
+    })
+    let loads = 0
+    spyOn(AutoModel, 'from_pretrained').mockImplementation(
+      async (id, options) => {
+        loads += 1
+        if (loads === 1) {
+          openModelFile(id, options)
+          await firstLoad
+          throw new Error(
+            "Can't create a session. ERROR_CODE: 7, ERROR_MESSAGE: Failed to load model because protobuf parsing failed.",
+          )
+        }
+        return model('logits') as never
+      },
+    )
+    const controller = new AbortController()
+    const pending = removeBackground(png, { signal: controller.signal })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    controller.abort()
+    await expect(pending).rejects.toMatchObject({ code: 'cancelled' })
+    // Loads that joined this read cannot evict the damaged copy, so the load
+    // that read it must, although nobody is waiting for it any more.
+    failFirst()
+    for (let i = 0; i < 5; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+    expect(entries.has(modelFile(LITE_MODEL))).toBe(false)
+  })
+
+  test('a load records the copy it opened, not the copy when it started', async () => {
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: { userAgent: 'Firefox/150.0' },
+    })
+    const entries = installCaches(() => undefined)
+    entries.set(
+      modelFile(LITE_MODEL),
+      new Response('x', {
+        headers: { 'content-length': String(LITE_MODEL.bytes) },
+      }),
+    )
+    const cache = () =>
+      env.customCache as {
+        put: (key: string, response: Response) => Promise<void>
+        delete: (key: string) => Promise<boolean>
+      }
+    let openFile: () => void = () => undefined
+    const fileReady = new Promise<void>((resolve) => {
+      openFile = resolve
+    })
+    let started: () => void = () => undefined
+    const loadStarted = new Promise<void>((resolve) => {
+      started = resolve
+    })
+    let retrySawDamaged: boolean | undefined
+    let loads = 0
+    spyOn(AutoModel, 'from_pretrained').mockImplementation(
+      async (id, options) => {
+        loads += 1
+        if (loads === 1) {
+          started()
+          await fileReady
+          // The file was evicted after this load started. It downloads a
+          // replacement that is damaged too, then opens it.
+          await cache().put(
+            modelFile(LITE_MODEL),
+            new Response('y', {
+              headers: { 'content-length': String(LITE_MODEL.bytes) },
+            }),
+          )
+          await new Promise((resolve) => setTimeout(resolve, 0))
+          openModelFile(id, options)
+          throw new Error(
+            "Can't create a session. ERROR_CODE: 7, ERROR_MESSAGE: Failed to load model because protobuf parsing failed.",
+          )
+        }
+        retrySawDamaged = entries.has(modelFile(LITE_MODEL))
+        return model('logits') as never
+      },
+    )
+    const pending = removeBackground(png)
+    await loadStarted
+    await cache().delete(modelFile(LITE_MODEL))
+    openFile()
+    expect(await pending).toMatchObject({
+      model: 'birefnet-lite',
+      provider: 'wasm',
+    })
+    expect(retrySawDamaged).toBe(false)
+  })
+
   test('a shared corrupt load keeps the retry download in the cache', async () => {
     Object.defineProperty(globalThis, 'navigator', {
       configurable: true,
