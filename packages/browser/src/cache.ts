@@ -121,6 +121,15 @@ export function createIndexedDbCache(): ModelCache {
     }
     database ??= openDatabase(() => {
       deleted = true
+    }).then((connection) => {
+      // Another tab may reset between the check above and the open request,
+      // so the open lands after its delete and no version change arrives.
+      if (createdAt !== resetMark()) {
+        deleted = true
+        connection.close()
+        throw new Error('The model cache was reset')
+      }
+      return connection
     })
     return database
   }

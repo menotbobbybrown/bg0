@@ -449,4 +449,29 @@ describe('IndexedDB model cache', () => {
     await unopened.put(url, sized(4))
     expect(await createIndexedDbCache().match(url)).toBeUndefined()
   })
+
+  test("another tab's reset that lands while this cache opens keeps it empty", async () => {
+    const factory = indexedDB
+    const seed = createIndexedDbCache()
+    await seed.put(url, sized(4))
+    const otherTab = './cache?tab=racing'
+    const other: typeof import('./cache') = await import(otherTab)
+    const old = createIndexedDbCache()
+    // The other tab resets after this cache checks for resets but before its
+    // open request is queued, so the open lands after the delete.
+    let reset: Promise<void> | undefined
+    Object.defineProperty(globalThis, 'indexedDB', {
+      configurable: true,
+      value: {
+        open: (name: string, version?: number) => {
+          reset ??= other.clearIndexedDbCache()
+          return factory.open(name, version)
+        },
+        deleteDatabase: (name: string) => factory.deleteDatabase(name),
+      },
+    })
+    await old.put(url, sized(4))
+    await reset
+    expect(await createIndexedDbCache().match(url)).toBeUndefined()
+  })
 })
