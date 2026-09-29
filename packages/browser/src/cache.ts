@@ -43,7 +43,7 @@ function chunkKey(key: string, index: number) {
   return `${key}#${index}`
 }
 
-function openDatabase(): Promise<IDBDatabase> {
+function openDatabase(onClosed: () => void): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const open = indexedDB.open(DB_NAME, DB_VERSION)
     open.onupgradeneeded = () => {
@@ -51,7 +51,16 @@ function openDatabase(): Promise<IDBDatabase> {
         open.result.createObjectStore(STORE)
       }
     }
-    open.onsuccess = () => resolve(open.result)
+    open.onsuccess = () => {
+      const connection = open.result
+      // A reset deletes the database. An open connection would block that
+      // delete, and every later open queues behind it, so close this one.
+      connection.onversionchange = () => {
+        connection.close()
+        onClosed()
+      }
+      resolve(connection)
+    }
     open.onerror = () =>
       reject(open.error ?? new Error('IndexedDB unavailable'))
     open.onblocked = () => reject(new Error('IndexedDB is blocked'))
@@ -83,7 +92,13 @@ export function isIndexedDbAvailable(): boolean {
 export function createIndexedDbCache(): ModelCache {
   let database: Promise<IDBDatabase> | undefined
   const db = () => {
-    if (!database) database = openDatabase()
+    if (!database) {
+      const opened = openDatabase(() => {
+        // The next use opens a new connection.
+        if (database === opened) database = undefined
+      })
+      database = opened
+    }
     return database
   }
   const pendingWrites = new Set<string>()
