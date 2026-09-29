@@ -89,20 +89,34 @@ export function isIndexedDbAvailable(): boolean {
   return typeof indexedDB !== 'undefined'
 }
 
-// Counts resets. A cache created before a reset belongs to the deleted
-// database.
+// Counts resets in this page. A cache created before a reset belongs to the
+// deleted database.
 let resets = 0
+// Every reset also writes a new value here, so a tab can tell that another
+// tab reset the cache even before its own cache has opened the database.
+const RESET_KEY = 'bg0:model-cache-reset'
+
+function resetMark(): string {
+  let shared: string | null = null
+  try {
+    shared = localStorage.getItem(RESET_KEY)
+  } catch {
+    // Without storage only resets in this page are seen.
+  }
+  return `${resets}:${shared}`
+}
 
 export function createIndexedDbCache(): ModelCache {
-  const createdAt = resets
+  const createdAt = resetMark()
   let database: Promise<IDBDatabase> | undefined
   let deleted = false
   // A load that started before a reset may still read or write through this
   // cache. Reopening would recreate the deleted database and write the model
-  // back, so once its database is deleted this cache stays empty. A version
-  // change from another tab's reset closes it the same way.
+  // back, so once its database is deleted this cache stays empty. Another
+  // tab's reset closes it the same way, through a version change if it is
+  // open and through the shared reset mark if it is not.
   const db = () => {
-    if (deleted || createdAt !== resets) {
+    if (deleted || createdAt !== resetMark()) {
       return Promise.reject(new Error('The model cache was reset'))
     }
     database ??= openDatabase(() => {
@@ -208,6 +222,11 @@ export function createIndexedDbCache(): ModelCache {
 export async function clearIndexedDbCache(): Promise<void> {
   resets += 1
   if (!isIndexedDbAvailable()) return
+  try {
+    localStorage.setItem(RESET_KEY, `${Date.now()}-${Math.random()}`)
+  } catch {
+    // Storage can be unavailable in privacy modes.
+  }
   await new Promise<void>((resolve) => {
     const req = indexedDB.deleteDatabase(DB_NAME)
     req.onsuccess = () => resolve()

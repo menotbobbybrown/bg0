@@ -371,6 +371,7 @@ describe('safe model cache', () => {
 
 describe('IndexedDB model cache', () => {
   let descriptor: PropertyDescriptor | undefined
+  let storage: PropertyDescriptor | undefined
   let warn: ReturnType<typeof spyOn> | undefined
 
   beforeEach(() => {
@@ -379,12 +380,23 @@ describe('IndexedDB model cache', () => {
       configurable: true,
       value: new IDBFactory(),
     })
+    storage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage')
+    const values = new Map<string, string>()
+    Object.defineProperty(globalThis, 'localStorage', {
+      configurable: true,
+      value: {
+        getItem: (key: string) => values.get(key) ?? null,
+        setItem: (key: string, value: string) => values.set(key, value),
+      },
+    })
     // A write through a reset cache is dropped with a warning.
     warn = spyOn(console, 'warn').mockImplementation(() => undefined)
   })
 
   afterEach(() => {
     warn?.mockRestore()
+    if (storage) Object.defineProperty(globalThis, 'localStorage', storage)
+    else Reflect.deleteProperty(globalThis, 'localStorage')
     if (descriptor) Object.defineProperty(globalThis, 'indexedDB', descriptor)
     else Reflect.deleteProperty(globalThis, 'indexedDB')
   })
@@ -423,6 +435,18 @@ describe('IndexedDB model cache', () => {
       deletion.onblocked = () => reject(new Error('blocked'))
     })
     await old.put(url, sized(4))
+    expect(await createIndexedDbCache().match(url)).toBeUndefined()
+  })
+
+  test("another tab's reset keeps a cache that has not opened yet empty", async () => {
+    const old = createIndexedDbCache()
+    await old.put(url, sized(4))
+    // A second copy of the module stands in for another tab.
+    const otherTab = './cache?tab=other'
+    const other: typeof import('./cache') = await import(otherTab)
+    const unopened = createIndexedDbCache()
+    await other.clearIndexedDbCache()
+    await unopened.put(url, sized(4))
     expect(await createIndexedDbCache().match(url)).toBeUndefined()
   })
 })
