@@ -1,0 +1,64 @@
+diff --git a/dist/transformers.js b/dist/transformers.js
+index 4f69097de6f717cf3b061880d03e4f41adaeb2d8..67947231252023ae5a4df1091398cf5880df06c9 100644
+--- a/dist/transformers.js
++++ b/dist/transformers.js
+@@ -13446,14 +13446,14 @@ async function createInferenceSession(buffer_or_path, session_options, session_c
+     logSeverityLevel,
+     ...session_options
+   });
+-  const session = await (apis.IS_WEB_ENV ? webInitChain = webInitChain.then(load) : load());
++  const session = await (apis.IS_WEB_ENV ? webInitChain = webInitChain.then(load, load) : load());
+   session.config = session_config;
+   return session;
+ }
+ var webInferenceChain = Promise.resolve();
+ async function runInferenceSession(session, ortFeed) {
+   const run = () => session.run(ortFeed);
+-  return apis.IS_WEB_ENV ? webInferenceChain = webInferenceChain.then(run) : run();
++  return apis.IS_WEB_ENV ? webInferenceChain = webInferenceChain.then(run, run) : run();
+ }
+ function isONNXTensor(x) {
+   return x instanceof ONNX.Tensor;
+diff --git a/dist/transformers.web.js b/dist/transformers.web.js
+index 5ac054cb23be44616d4e3ef32813e1e7c3acef41..8837556d5ff8bd67f2cde906bd9b01de888c679c 100644
+--- a/dist/transformers.web.js
++++ b/dist/transformers.web.js
+@@ -8704,14 +8704,14 @@ async function createInferenceSession(buffer_or_path, session_options, session_c
+     logSeverityLevel,
+     ...session_options
+   });
+-  const session = await (apis.IS_WEB_ENV ? webInitChain = webInitChain.then(load) : load());
++  const session = await (apis.IS_WEB_ENV ? webInitChain = webInitChain.then(load, load) : load());
+   session.config = session_config;
+   return session;
+ }
+ var webInferenceChain = Promise.resolve();
+ async function runInferenceSession(session, ortFeed) {
+   const run = () => session.run(ortFeed);
+-  return apis.IS_WEB_ENV ? webInferenceChain = webInferenceChain.then(run) : run();
++  return apis.IS_WEB_ENV ? webInferenceChain = webInferenceChain.then(run, run) : run();
+ }
+ function isONNXTensor(x) {
+   return x instanceof ONNX.Tensor;
+diff --git a/src/backends/onnx.js b/src/backends/onnx.js
+index 7dbfe44ba4a5e02073c6f1f152675bbf885d2be9..6c5df825f5b167c21b0fe47b17253c2ea13f8ac0 100644
+--- a/src/backends/onnx.js
++++ b/src/backends/onnx.js
+@@ -287,7 +287,7 @@ export async function createInferenceSession(buffer_or_path, session_options, se
+             logSeverityLevel,
+             ...session_options,
+         });
+-    const session = await (apis.IS_WEB_ENV ? (webInitChain = webInitChain.then(load)) : load());
++    const session = await (apis.IS_WEB_ENV ? (webInitChain = webInitChain.then(load, load)) : load());
+     session.config = session_config;
+     return session;
+ }
+@@ -307,7 +307,7 @@ let webInferenceChain = Promise.resolve();
+  */
+ export async function runInferenceSession(session, ortFeed) {
+     const run = () => session.run(ortFeed);
+-    return apis.IS_WEB_ENV ? (webInferenceChain = webInferenceChain.then(run)) : run();
++    return apis.IS_WEB_ENV ? (webInferenceChain = webInferenceChain.then(run, run)) : run();
+ }
+ 
+ /**

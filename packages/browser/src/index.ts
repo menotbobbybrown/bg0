@@ -1,9 +1,24 @@
 import {
   clearIndexedDbCache,
   createIndexedDbCache,
+  createSafeCache,
   isIndexedDbAvailable,
+  type ModelCache,
 } from './cache'
+import {
+  createLoadWatch,
+  type LoadWatch,
+  ModelDownloadError,
+  ModelStartTimeoutError,
+  modelLoadTimings,
+} from './download'
 import { BackgroundRemovalError, normalizeError } from './errors'
+import {
+  blockFullModel,
+  clearFullModelGuard,
+  isFullModelBlocked,
+  markFullModelRunning,
+} from './guard'
 import {
   decodeImage,
   imageToPng,
@@ -12,19 +27,20 @@ import {
   prepareImageForInference,
   validateImage,
 } from './image'
+import { clearIosModel, prepareIosModel, removeIosBackground } from './ios'
 import {
   detectEngineChoices,
-  engineKey,
-  LITE_MODEL,
-  modelUrl,
   type EngineChoice,
   type ExecutionProvider,
+  engineKey,
+  FULL_MODEL,
+  LITE_MODEL,
   type ModelDefinition,
+  modelUrl,
   type RemovalModel,
 } from './models'
 import { createMaskRefinement, type InferenceMask } from './refinement'
 import { canUseOnnxWebGpu, shouldUseSingleThreadedWasm } from './runtime'
-import { clearIosModel, prepareIosModel, removeIosBackground } from './ios'
 
 function useIosModel() {
   return (
@@ -44,13 +60,15 @@ export {
 } from './image'
 
 export type RemovalQuality = 'fast' | 'quality'
-export { shouldUseSingleThreadedWasm as isIosBrowser } from './runtime'
 export type { ExecutionProvider, RemovalModel } from './models'
+export { shouldUseSingleThreadedWasm as isIosBrowser } from './runtime'
 
 export interface RemovalProgress {
   stage: 'preparing' | 'downloading' | 'processing' | 'finishing'
   progress: number
   message: string
+  /** Model bytes received so far. Present only while the model downloads. */
+  download?: { loadedBytes: number; totalBytes: number }
   /** Execution provider, once the engine for this run has been chosen. */
   provider?: ExecutionProvider
 }
@@ -103,18 +121,27 @@ type EngineLease = {
   release: () => Promise<void>
 }
 
-type EngineProgress = { progress: number; initializing: boolean }
+type EngineProgress = {
+  progress: number
+  initializing: boolean
+  loadedBytes: number
+  totalBytes: number
+}
+type EngineProgressListener = (progress: EngineProgress) => void
 type EngineLoad = {
   promise: Promise<Engine>
-  listeners: Set<(progress: number, initializing: boolean) => void>
+  listeners: Set<EngineProgressListener>
   progress?: EngineProgress
   users: number
   retired: boolean
   disposal?: Promise<void>
 }
 
+const MODEL_CACHE_NAME = 'transformers-cache'
 const engineLoads = new Map<string, EngineLoad>()
 const failedEngines = new Set<string>()
+// Engines already retried once after their cached model was evicted as corrupt.
+const reloadedEngines = new Set<string>()
 let detectedChoices: Promise<EngineChoice[]> | undefined
 let webgpuUsableForSession = true
 
@@ -135,13 +162,16 @@ export function clearModelCache(): void {
   }
   engineLoads.clear()
   failedEngines.clear()
+  reloadedEngines.clear()
   detectedChoices = undefined
   webgpuUsableForSession = true
+  modelCache = undefined
   try {
     localStorage.removeItem(WEBGPU_FAILURE_KEY)
   } catch {
     // Storage can be unavailable in privacy modes. The in-memory reset remains useful.
   }
+  clearFullModelGuard()
   void clearIndexedDbCache()
 }
 
@@ -211,15 +241,25 @@ export async function removeBackground(
 
     lease = await getPreferredEngine(
       choices,
-      (progress, initializing, modelIsCached) => {
+      (load, modelIsCached, provider) => {
+        const downloading = !modelIsCached && !load.initializing
         notify({
-          stage: modelIsCached || initializing ? 'preparing' : 'downloading',
-          progress: 0.08 + progress * 0.58,
-          message: initializing
+          stage: downloading ? 'downloading' : 'preparing',
+          progress: 0.08 + load.progress * 0.58,
+          message: load.initializing
             ? 'Starting local model…'
             : modelIsCached
               ? 'Loading cached model…'
               : 'Downloading local model…',
+          provider,
+          ...(downloading && load.totalBytes > 0
+            ? {
+                download: {
+                  loadedBytes: load.loadedBytes,
+                  totalBytes: load.totalBytes,
+                },
+              }
+            : {}),
         })
       },
       options.signal,
@@ -272,13 +312,23 @@ export async function removeBackground(
         })
         lease = await getPreferredEngine(
           choices,
-          (progress, initializing, cached) => {
+          (load, cached, provider) => {
+            const downloading = !cached && !load.initializing
             notify({
-              stage: initializing || cached ? 'preparing' : 'downloading',
-              progress: 0.74 + progress * 0.14,
-              message: initializing
+              stage: downloading ? 'downloading' : 'preparing',
+              progress: 0.74 + load.progress * 0.14,
+              message: load.initializing
                 ? 'Starting compatibility mode…'
                 : 'Preparing compatibility mode…',
+              provider,
+              ...(downloading && load.totalBytes > 0
+                ? {
+                    download: {
+                      loadedBytes: load.loadedBytes,
+                      totalBytes: load.totalBytes,
+                    },
+                  }
+                : {}),
             })
           },
           options.signal,
@@ -382,25 +432,73 @@ export async function removeBackground(
 async function getPreferredEngine(
   choices: EngineChoice[],
   onDownload: (
-    progress: number,
-    initializing: boolean,
+    progress: EngineProgress,
     cached: boolean,
+    provider: ExecutionProvider,
   ) => void,
   signal?: AbortSignal,
 ): Promise<EngineLease> {
   let lastError: unknown
-  for (const choice of choices) {
+  // A model whose download failed is not retried with another runtime in the
+  // same walk: the file is shared, so the second attempt would fail the same way.
+  const unreachableModels = new Set<string>()
+  // Runtime files differ per provider, so their failure only skips that one.
+  const unreachableProviders = new Set<ExecutionProvider>()
+  const queue = [...choices]
+  for (let index = 0; index < queue.length; index += 1) {
+    const choice = queue[index]
     throwIfCancelled(signal)
-    if (failedEngines.has(engineKey(choice))) continue
+    const key = engineKey(choice)
+    if (
+      failedEngines.has(key) ||
+      unreachableModels.has(choice.definition.id) ||
+      unreachableProviders.has(choice.provider)
+    )
+      continue
     const cached = await isModelCached(choice.definition)
     throwIfCancelled(signal)
-    if (failedEngines.has(engineKey(choice))) continue
+    if (failedEngines.has(key)) continue
     try {
-      return await getEngine(choice, (progress, initializing) => {
-        onDownload(progress, initializing, cached)
-      })
+      return await getEngine(
+        choice,
+        (progress) => onDownload(progress, cached, choice.provider),
+        signal,
+      )
     } catch (error) {
+      throwIfCancelled(signal)
       lastError = error
+      if (error instanceof ModelStartTimeoutError) {
+        // The runtime queues session creation, so a start that never ends
+        // would block every later choice too. Stop here and ask for a reload.
+        rememberEngineFailure(choice)
+        if (choice.definition.name === 'birefnet') blockFullModel()
+        break
+      }
+      if (error instanceof ModelDownloadError) {
+        // Network trouble says nothing about the GPU. Do not disable WebGPU.
+        if (error.asset === 'runtime') {
+          unreachableProviders.add(choice.provider)
+          continue
+        }
+        // Stop re-downloading the large model in this session.
+        unreachableModels.add(choice.definition.id)
+        if (choice.definition.name === 'birefnet') failedEngines.add(key)
+        continue
+      }
+      if (isCorruptModelError(error)) {
+        // A damaged cached file fails every later load until it is replaced.
+        await evictCachedModel(choice.definition)
+        throwIfCancelled(signal)
+        // Retry once with a fresh download: for lite WASM there is no later
+        // choice. A download that is corrupt again is not fetched a third time.
+        if (!reloadedEngines.has(key)) {
+          reloadedEngines.add(key)
+          queue.splice(index + 1, 0, choice)
+        } else {
+          failedEngines.add(key)
+        }
+        continue
+      }
       // Leave the final lite WASM path retryable after a transient error.
       if (
         choice.provider === 'webgpu' ||
@@ -416,24 +514,66 @@ async function getPreferredEngine(
 async function getPreferredChoices(): Promise<EngineChoice[]> {
   detectedChoices ??= detectEngineChoices()
   const choices = await detectedChoices
-  return choices.filter(
-    (choice) => choice.provider !== 'webgpu' || canTryWebgpu(),
+  const skipFullModel = isFullModelBlocked()
+  const usable = choices.filter(
+    (choice) =>
+      (choice.provider !== 'webgpu' || canTryWebgpu()) &&
+      (choice.definition.name !== 'birefnet' || !skipFullModel),
   )
+  // Detection always ends with lite WASM, but keep a usable path regardless.
+  return usable.length > 0
+    ? usable
+    : [{ definition: LITE_MODEL, provider: 'wasm' }]
+}
+
+function isCorruptModelError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return /protobuf|failed to load model|invalid model/i.test(message)
+}
+
+function expectedModelBytes(url: string): number | undefined {
+  for (const definition of [LITE_MODEL, FULL_MODEL]) {
+    if (url === modelUrl(definition)) return definition.bytes
+  }
+  return undefined
+}
+
+let modelCache: ReturnType<typeof createSafeCache> | undefined
+
+/** The cache transformers.js reads and writes, wrapped so it cannot fail a load. */
+function getModelCache(): ReturnType<typeof createSafeCache> | undefined {
+  if (modelCache) return modelCache
+  // The Cache API only exists in secure contexts. Fall back to IndexedDB so
+  // the model is still cached on plain-http previews and older browsers.
+  let open: (() => Promise<ModelCache | undefined>) | undefined
+  const indexedDb = isIndexedDbAvailable() ? createIndexedDbCache() : undefined
+  if (typeof caches !== 'undefined') {
+    // Some browsers expose the Cache API but reject opening it, for example
+    // in private windows. IndexedDB may still work there.
+    open = () =>
+      caches.open(MODEL_CACHE_NAME).catch((error: unknown) => {
+        if (indexedDb) return indexedDb
+        throw error
+      })
+  } else if (indexedDb) {
+    open = async () => indexedDb
+  }
+  if (!open) return undefined
+  modelCache = createSafeCache(open, expectedModelBytes)
+  return modelCache
+}
+
+async function evictCachedModel(model: ModelDefinition): Promise<void> {
+  await getModelCache()?.delete(modelUrl(model))
 }
 
 async function isModelCached(model: ModelDefinition): Promise<boolean> {
-  const url = modelUrl(model)
   try {
-    if (typeof caches !== 'undefined') {
-      return Boolean(await (await caches.open('transformers-cache')).match(url))
-    }
-    if (isIndexedDbAvailable()) {
-      return Boolean(await createIndexedDbCache().match(url))
-    }
+    return Boolean(await getModelCache()?.match(modelUrl(model)))
   } catch {
     // A blocked cache should not prevent local inference.
+    return false
   }
-  return false
 }
 
 function rememberEngineFailure(choice: EngineChoice): void {
@@ -477,23 +617,29 @@ function rememberWebgpuFailure(): void {
 
 async function getEngine(
   choice: EngineChoice,
-  onDownload: (progress: number, initializing: boolean) => void,
+  onDownload: EngineProgressListener,
+  signal?: AbortSignal,
 ): Promise<EngineLease> {
   const key = engineKey(choice)
   let load = engineLoads.get(key)
   if (!load) {
     const listeners: EngineLoad['listeners'] = new Set()
     let currentLoad: EngineLoad
-    const promise = loadEngine(choice, (progress, initializing) => {
+    const promise = loadEngine(choice, (progress) => {
       if (engineLoads.get(key) !== currentLoad) return
-      currentLoad.progress = { progress, initializing }
+      currentLoad.progress = progress
       for (const listener of currentLoad.listeners) {
-        notifyEngineProgress(listener, currentLoad.progress)
+        notifyEngineProgress(listener, progress)
       }
     })
     currentLoad = { promise, listeners, users: 0, retired: false }
     load = currentLoad
     engineLoads.set(key, load)
+    // A failed load must not be reused, even when every caller cancelled
+    // before it settled and nobody is left to evict it.
+    promise.catch(() => {
+      if (engineLoads.get(key) === currentLoad) engineLoads.delete(key)
+    })
   }
 
   // Reserve before awaiting initialization or notifying callers: a cache reset
@@ -512,7 +658,9 @@ async function getEngine(
     if (reservedLoad.progress) {
       notifyEngineProgress(onDownload, reservedLoad.progress)
     }
-    const engine = await reservedLoad.promise
+    // Cancelling stops this caller from waiting. The shared load continues
+    // for other callers and for the next image.
+    const engine = await untilCancelled(reservedLoad.promise, signal)
     if (engineLoads.get(key) === reservedLoad) reservedLoad.progress = undefined
     return {
       engine,
@@ -523,7 +671,9 @@ async function getEngine(
       release,
     }
   } catch (error) {
-    if (engineLoads.get(key) === reservedLoad) engineLoads.delete(key)
+    if (!signal?.aborted && engineLoads.get(key) === reservedLoad) {
+      engineLoads.delete(key)
+    }
     await release()
     throw error
   } finally {
@@ -531,26 +681,63 @@ async function getEngine(
   }
 }
 
+function untilCancelled<T>(promise: Promise<T>, signal?: AbortSignal) {
+  if (!signal) return promise
+  throwIfCancelled(signal)
+  let onAbort: (() => void) | undefined
+  const cancelled = new Promise<never>((_resolve, reject) => {
+    onAbort = () =>
+      reject(
+        new BackgroundRemovalError('cancelled', 'Processing was cancelled.'),
+      )
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+  return Promise.race([promise, cancelled]).finally(() => {
+    if (onAbort) signal.removeEventListener('abort', onAbort)
+  })
+}
+
 function notifyEngineProgress(
-  listener: (progress: number, initializing: boolean) => void,
+  listener: EngineProgressListener,
   progress: EngineProgress,
 ): void {
   try {
-    listener(progress.progress, progress.initializing)
+    listener(progress)
   } catch {
     // Progress reporting is advisory and must not interrupt model loading.
   }
 }
 
 function modelLoadError(error: unknown) {
-  return new BackgroundRemovalError(
-    'model-load-failed',
-    'The local model could not be loaded. Check your connection and try again.',
-    { cause: error },
-  )
+  let message =
+    'The local model could not be loaded. Check your connection and try again.'
+  if (error instanceof ModelStartTimeoutError) {
+    message =
+      'The local model took too long to start. Reload the page and try again.'
+  } else if (
+    error instanceof ModelDownloadError &&
+    error.reason === 'stalled'
+  ) {
+    message =
+      'The model download stopped responding. Check your connection and try again.'
+  }
+  return new BackgroundRemovalError('model-load-failed', message, {
+    cause: error,
+  })
 }
 
 async function inferMask(engine: Engine, source: unknown) {
+  // Running the full model is where low-memory tabs get killed.
+  const settle =
+    engine.definition.name === 'birefnet' ? markFullModelRunning() : undefined
+  try {
+    return await runInference(engine, source)
+  } finally {
+    settle?.()
+  }
+}
+
+async function runInference(engine: Engine, source: unknown) {
   const processed = await engine.processor(source)
   const pixelValues = processed.pixel_values
   if (!pixelValues) throw new Error('Image preprocessing failed')
@@ -584,7 +771,8 @@ async function inferMask(engine: Engine, source: unknown) {
  */
 function createDownloadTracker(
   modelBytes: number,
-  onDownload: (progress: number, initializing: boolean) => void,
+  onDownload: EngineProgressListener,
+  onModelFileReady: () => void = () => undefined,
 ) {
   const files = new Map<string, { loaded: number; total: number }>()
   let reported = 0
@@ -594,7 +782,7 @@ function createDownloadTracker(
     return file.endsWith('.onnx') ? modelBytes : 4096
   }
 
-  const report = () => {
+  const totals = () => {
     let loaded = 0
     let total = 0
     let sawModel = false
@@ -606,10 +794,20 @@ function createDownloadTracker(
     // Until the model file is announced the small config files would read
     // as "done"; hold the bar back so it only moves forward.
     if (!sawModel) total += modelBytes
+    return { loaded, total }
+  }
+
+  const report = () => {
+    const { loaded, total } = totals()
     const value = total > 0 ? loaded / total : 0
     if (value > reported) {
       reported = value
-      onDownload(Math.min(1, value), false)
+      onDownload({
+        progress: Math.min(1, value),
+        initializing: false,
+        loadedBytes: loaded,
+        totalBytes: total,
+      })
     }
   }
 
@@ -641,45 +839,149 @@ function createDownloadTracker(
     }
     report()
     if (data.status === 'done' && data.file.endsWith('.onnx')) {
-      onDownload(1, true)
+      onModelFileReady()
+      const { total } = totals()
+      onDownload({
+        progress: 1,
+        initializing: true,
+        loadedBytes: total,
+        totalBytes: total,
+      })
     }
   }
 }
 
+type TransformersEnv = {
+  fetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
+  useBrowserCache: boolean
+  useCustomCache: boolean
+  customCache: unknown
+}
+
+type WatchedLoad = { watch: LoadWatch; definition: ModelDefinition }
+const watchedLoads = new Set<WatchedLoad>()
+let networkFetch: TransformersEnv['fetch'] | undefined
+let supervisedFetch: TransformersEnv['fetch'] | undefined
+
+/**
+ * Route every transformers.js request through the watchdog of the load that
+ * made it. Model files carry the model id in their URL. Runtime files, such
+ * as the ONNX Runtime binary, go to the newest load. A fetch installed on
+ * `env` by the host page is kept as the underlying transport.
+ */
+function superviseFetch(env: TransformersEnv): TransformersEnv['fetch'] {
+  if (!supervisedFetch || env.fetch !== supervisedFetch) {
+    networkFetch = env.fetch
+    supervisedFetch = (input, init) => {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url
+      const loads = [...watchedLoads]
+      const owner =
+        loads.find((entry) => isModelFileUrl(url, entry.definition)) ??
+        loads.at(-1)
+      return owner ? owner.watch.fetch(input, init) : baseFetch(input, init)
+    }
+    env.fetch = supervisedFetch
+  }
+  return baseFetch
+}
+
+function isModelFileUrl(url: string, definition?: ModelDefinition): boolean {
+  const definitions = definition ? [definition] : [LITE_MODEL, FULL_MODEL]
+  return definitions.some((entry) => url.includes(`/${entry.id}/`))
+}
+
+function baseFetch(input: RequestInfo | URL, init?: RequestInit) {
+  if (!networkFetch) return fetch(input, init)
+  return networkFetch(input, init)
+}
+
+function configureModelCache(env: TransformersEnv): void {
+  const cache = getModelCache()
+  env.useBrowserCache = false
+  env.useCustomCache = Boolean(cache)
+  env.customCache = cache ?? null
+}
+
 async function loadEngine(
   choice: EngineChoice,
-  onDownload: (progress: number, initializing: boolean) => void,
+  onDownload: EngineProgressListener,
 ): Promise<Engine> {
   const { provider, definition } = choice
   const { AutoModel, AutoProcessor, env } = await import(
     '@huggingface/transformers'
   )
-  // The Cache API only exists in secure contexts. Fall back to IndexedDB so
-  // the model is still cached on plain-http previews and older browsers.
-  if (typeof caches !== 'undefined') {
-    env.useBrowserCache = true
-  } else if (isIndexedDbAvailable()) {
-    env.useBrowserCache = false
-    env.useCustomCache = true
-    env.customCache = createIndexedDbCache()
-  } else {
-    env.useBrowserCache = false
+  const transformersEnv = env as unknown as TransformersEnv
+  configureModelCache(transformersEnv)
+  const watch = createLoadWatch(superviseFetch(transformersEnv), {
+    ...modelLoadTimings,
+    expectedBytes: (url) =>
+      url === modelUrl(definition) ? definition.bytes : undefined,
+    // Model files carry the model id in their URL, as in `superviseFetch`.
+    assetOf: (url) => (isModelFileUrl(url) ? 'model' : 'runtime'),
+  })
+  const watched = { watch, definition }
+  watchedLoads.add(watched)
+  let settleFullModel: (() => void) | undefined
+  const progressCallback = createDownloadTracker(
+    definition.bytes,
+    onDownload,
+    () => {
+      // Session creation for the full model is where low-memory tabs die.
+      if (definition.name === 'birefnet') {
+        settleFullModel ??= markFullModelRunning()
+      }
+    },
+  )
+  const trackedProgress = (event: unknown) => {
+    watch.touch()
+    progressCallback(event)
   }
 
-  const progressCallback = createDownloadTracker(definition.bytes, onDownload)
+  let abandoned = false
+  const pending = (async (): Promise<Engine> => {
+    const processor = (await AutoProcessor.from_pretrained(definition.id, {
+      revision: definition.revision,
+      progress_callback: trackedProgress,
+    })) as unknown as ProcessorRunner
 
-  const processor = (await AutoProcessor.from_pretrained(definition.id, {
-    revision: definition.revision,
-    progress_callback: progressCallback,
-  })) as unknown as ProcessorRunner
+    const model = (await AutoModel.from_pretrained(definition.id, {
+      revision: definition.revision,
+      device: provider,
+      dtype: 'fp16',
+      progress_callback: trackedProgress,
+    })) as unknown as ModelRunner
+    return { model, processor, ...choice }
+  })()
+  // A load that finishes after its watchdog gave up must not hold memory.
+  pending.then(
+    (engine) => {
+      if (abandoned) void engine.model.dispose().catch(() => undefined)
+    },
+    () => undefined,
+  )
 
-  const model = (await AutoModel.from_pretrained(definition.id, {
-    revision: definition.revision,
-    device: provider,
-    dtype: 'fp16',
-    progress_callback: progressCallback,
-  })) as unknown as ModelRunner
-  return { model, processor, ...choice }
+  try {
+    return await Promise.race([pending, watch.failed])
+  } catch (error) {
+    abandoned = true
+    if (
+      error instanceof ModelStartTimeoutError ||
+      error instanceof ModelDownloadError
+    ) {
+      throw error
+    }
+    // transformers.js may replace a failed request with its own error.
+    throw watch.downloadFailure ?? error
+  } finally {
+    watch.dispose()
+    watchedLoads.delete(watched)
+    settleFullModel?.()
+  }
 }
 
 function throwIfCancelled(signal?: AbortSignal): void {

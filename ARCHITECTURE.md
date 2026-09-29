@@ -83,6 +83,23 @@ provider, then lite on WASM if necessary.
 Failed full-model and GPU engines are skipped for the page session and disposed
 after pending preparation and removal calls release them, including refinement.
 A full-model failure does not disable lite WebGPU.
+
+Every load failure walks the same list: full to lite, then WebGPU to WASM. A
+download that stops sending bytes for 30 seconds, a short body, or a network
+error marks that model file unreachable for the page and moves on without
+disabling WebGPU. A cached model that ONNX cannot parse is evicted before the
+next attempt. A GPU adapter that does not answer within 5 seconds counts as no
+GPU. If a model has not started after 150 seconds, loading stops with a
+retryable error instead of trying a heavier fallback on a struggling device.
+
+A tab killed by the browser while the full model starts or runs leaves a marker
+in sessionStorage. The next attempt in that tab skips the full model, and the
+device keeps using lite for a week. Clearing the model cache removes the block.
+
+BG0 patches the ONNX backend of the pinned Transformers.js release so one
+failed session creation or inference no longer rejects every later one in the
+page. The patch applies to this repository's builds; consumers installing
+`@bg0/browser` from npm do not get it.
 The existing `quality` option controls mask refinement independently of model
 selection. Detection and fallback stay inside the browser package.
 
@@ -159,7 +176,9 @@ were not separately confirmed; iPad/other iPhones remain unverified.
 ## Model cache
 
 Desktop/Android: on HTTPS, Transformers.js uses the browser Cache API. Development origins that
-cannot use Cache Storage fall back to BG0's IndexedDB adapter. Calls in the same
+cannot use Cache Storage fall back to BG0's IndexedDB adapter. Cache writes run
+in the background and a failed write never fails the load. A cached model whose
+size does not match the pinned file is deleted and downloaded again. Calls in the same
 page reuse an initialized engine. A reload can reuse stored model files but must
 still initialize ONNX and upload weights to WebGPU. Browser storage eviction,
 private browsing, or clearing site data can require another download.

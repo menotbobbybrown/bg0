@@ -141,4 +141,19 @@ describe('hardware-based model selection', () => {
       ])
     }
   })
+
+  test('a GPU that never answers falls back to CPU choices', async () => {
+    const hanging = {
+      requestAdapter: () => new Promise<never>(() => undefined),
+    }
+    expect(
+      await detectEngineChoices(
+        { userAgent: chrome, gpu: hanging, hardwareConcurrency: 8 },
+        { adapterTimeoutMs: 5 },
+      ),
+    ).toEqual([
+      { definition: FULL_MODEL, provider: 'wasm' },
+      { definition: LITE_MODEL, provider: 'wasm' },
+    ])
+  })
 })

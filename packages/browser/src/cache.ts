@@ -8,7 +8,8 @@
  * from a cache, `match` and `put`, on top of it.
  *
  * Files are stored in chunks so a 200 MB model never becomes a single record,
- * and writes happen in the background so inference is never held up by disk.
+ * and `createSafeCache` runs writes in the background so inference is never
+ * held up by disk.
  */
 
 const DB_NAME = 'bg0-model-cache'
@@ -25,6 +26,7 @@ interface FileMeta {
 export interface ModelCache {
   match(request: RequestInfo | URL): Promise<Response | undefined>
   put(request: RequestInfo | URL, response: Response): Promise<void>
+  delete?(request: RequestInfo | URL): Promise<boolean>
 }
 
 function keyOf(request: RequestInfo | URL): string {
@@ -136,6 +138,29 @@ export function createIndexedDbCache(): ModelCache {
         return undefined
       }
     },
+    async delete(input) {
+      const key = keyOf(input)
+      try {
+        const connection = await db()
+        const store = connection
+          .transaction(STORE, 'readonly')
+          .objectStore(STORE)
+        const meta = await request<FileMeta | undefined>(
+          store.get(metaKey(key)),
+        )
+        if (!meta) return false
+        const transaction = connection.transaction(STORE, 'readwrite')
+        const writable = transaction.objectStore(STORE)
+        writable.delete(metaKey(key))
+        for (let index = 0; index < meta.chunks; index += 1) {
+          writable.delete(chunkKey(key, index))
+        }
+        await settle(transaction)
+        return true
+      } catch {
+        return false
+      }
+    },
     async put(input, response) {
       const key = keyOf(input)
       const body = await response.arrayBuffer()
@@ -143,10 +168,11 @@ export function createIndexedDbCache(): ModelCache {
       for (const [name, value] of response.headers) {
         if (name.toLowerCase() !== 'content-length') headers.push([name, value])
       }
-      // Do not block model loading on the disk write. A failed write only
-      // means the next visit downloads again.
+      // Resolve only once the write settles so an eviction can tell when a
+      // late write has landed. `createSafeCache` keeps loads from waiting on
+      // it. A failed write only means the next visit downloads again.
       pendingWrites.add(key)
-      void write(key, body, headers)
+      await write(key, body, headers)
         .catch((error) => {
           console.warn('BG0 could not cache the model locally:', error)
         })
@@ -163,4 +189,99 @@ export async function clearIndexedDbCache(): Promise<void> {
     req.onerror = () => resolve()
     req.onblocked = () => resolve()
   })
+}
+
+/**
+ * Make a cache safe to hand to transformers.js.
+ *
+ * transformers.js awaits `put` before it reports a file as loaded, and some
+ * of its call sites do not catch a rejected write. A full disk, a quota
+ * error or a private-mode restriction would then fail or delay the model load
+ * even though the bytes are already in memory. Writes here start immediately
+ * but are never awaited, and their errors are dropped: a failed write only
+ * means the next visit downloads again.
+ *
+ * Reads that fail count as a miss. A cached entry whose recorded size differs
+ * from the expected size is removed instead of being handed to the runtime,
+ * because a truncated model fails every later load until it is replaced.
+ *
+ * A model can be rejected and evicted before its own background write lands.
+ * Eviction therefore reads the key as a miss until every write already in
+ * flight has settled, then deletes it again, so a late write cannot restore
+ * the evicted file.
+ */
+export function createSafeCache(
+  open: () => Promise<ModelCache | undefined>,
+  expectedBytes: (url: string) => number | undefined = () => undefined,
+): ModelCache & { delete(request: RequestInfo | URL): Promise<boolean> } {
+  let opened: Promise<ModelCache | undefined> | undefined
+  const cache = () => {
+    opened ??= open().catch(() => undefined)
+    return opened
+  }
+  const writes = new Map<string, Set<Promise<void>>>()
+  const evicting = new Map<string, Promise<unknown>>()
+  const remove = async (input: RequestInfo | URL) => {
+    try {
+      return Boolean(await (await cache())?.delete?.(input))
+    } catch {
+      return false
+    }
+  }
+  const evict = (input: RequestInfo | URL) => {
+    const key = keyOf(input)
+    const pending = writes.get(key)
+    if (pending?.size) {
+      const settled = Promise.all(pending).then(() => remove(input))
+      evicting.set(key, settled)
+      void settled.finally(() => {
+        if (evicting.get(key) === settled) evicting.delete(key)
+      })
+    }
+    return remove(input)
+  }
+
+  return {
+    async match(input) {
+      if (evicting.has(keyOf(input))) return undefined
+      let response: Response | undefined
+      try {
+        response = (await (await cache())?.match(input)) ?? undefined
+      } catch {
+        return undefined
+      }
+      if (!response) return undefined
+      const expected = expectedBytes(keyOf(input))
+      const length = response.headers.get('content-length')
+      if (
+        expected !== undefined &&
+        length !== null &&
+        Number(length) !== expected
+      ) {
+        await evict(input)
+        return undefined
+      }
+      return response
+    },
+    async put(input, response) {
+      const key = keyOf(input)
+      const write = (async () => {
+        try {
+          await (await cache())?.put(input, response)
+        } catch {
+          // Caching is an optimization. The model is already in memory.
+        }
+      })()
+      const pending = writes.get(key) ?? new Set()
+      pending.add(write)
+      writes.set(key, pending)
+      void write.finally(() => {
+        pending.delete(write)
+        if (pending.size === 0 && writes.get(key) === pending) {
+          writes.delete(key)
+        }
+      })
+    },
+    delete: evict,
+  }
 }

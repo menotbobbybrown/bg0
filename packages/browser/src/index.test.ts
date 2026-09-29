@@ -7,7 +7,14 @@ import {
   spyOn,
   test,
 } from 'bun:test'
-import { AutoModel, AutoProcessor, Tensor } from '@huggingface/transformers'
+import {
+  AutoModel,
+  AutoProcessor,
+  env,
+  Tensor,
+} from '@huggingface/transformers'
+import * as cacheModule from './cache'
+import { modelLoadTimings } from './download'
 import * as image from './image'
 import {
   clearModelCache,
@@ -418,6 +425,421 @@ describe('automatic model lifecycle', () => {
   )
 })
 
+describe('model load recovery', () => {
+  const originalFetch = env.fetch
+  const timings = { ...modelLoadTimings }
+  const cachesDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'caches')
+  const sessionDescriptor = Object.getOwnPropertyDescriptor(
+    globalThis,
+    'sessionStorage',
+  )
+  const modelFile = (definition: typeof FULL_MODEL) =>
+    `https://huggingface.co/${definition.id}/resolve/${definition.revision}/onnx/model_fp16.onnx`
+
+  afterEach(() => {
+    env.fetch = originalFetch
+    Object.assign(modelLoadTimings, timings)
+    for (const [key, descriptor] of [
+      ['caches', cachesDescriptor],
+      ['sessionStorage', sessionDescriptor],
+    ] as const) {
+      if (descriptor) Object.defineProperty(globalThis, key, descriptor)
+      else Reflect.deleteProperty(globalThis, key)
+    }
+  })
+
+  function installCaches(put: (key: string, response: Response) => unknown) {
+    const entries = new Map<string, Response>()
+    Object.defineProperty(globalThis, 'caches', {
+      configurable: true,
+      value: {
+        open: async () => ({
+          match: async (key: string) => entries.get(key)?.clone(),
+          put: async (key: string, response: Response) => {
+            await put(key, response)
+            entries.set(key, response)
+          },
+          delete: async (key: string) => entries.delete(key),
+        }),
+      },
+    })
+    return entries
+  }
+
+  test('a corrupt cached model is evicted and the lite model still loads', async () => {
+    const entries = installCaches(() => undefined)
+    entries.set(
+      modelFile(FULL_MODEL),
+      new Response('x', {
+        headers: { 'content-length': String(FULL_MODEL.bytes) },
+      }),
+    )
+    const load = spyOn(AutoModel, 'from_pretrained').mockImplementation(
+      async (id) => {
+        if (id === FULL_MODEL.id) {
+          throw new Error(
+            "Can't create a session. ERROR_CODE: 7, ERROR_MESSAGE: Failed to load model because protobuf parsing failed.",
+          )
+        }
+        return model('logits') as never
+      },
+    )
+    expect(await removeBackground(png)).toMatchObject({
+      model: 'birefnet-lite',
+      provider: 'webgpu',
+    })
+    expect(entries.has(modelFile(FULL_MODEL))).toBe(false)
+    // The full model is downloaded again once before falling back.
+    expect(load.mock.calls.map((call) => call[0])).toEqual([
+      FULL_MODEL.id,
+      FULL_MODEL.id,
+      LITE_MODEL.id,
+    ])
+    expect(storage.size).toBe(0)
+  })
+
+  test('a corrupt lite WASM model is evicted and downloaded again once', async () => {
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: { userAgent: 'Firefox/150.0' },
+    })
+    const entries = installCaches(() => undefined)
+    entries.set(
+      modelFile(LITE_MODEL),
+      new Response('x', {
+        headers: { 'content-length': String(LITE_MODEL.bytes) },
+      }),
+    )
+    const corrupt = new Error(
+      "Can't create a session. ERROR_CODE: 7, ERROR_MESSAGE: Failed to load model because protobuf parsing failed.",
+    )
+    let corruptLoads = 1
+    const load = spyOn(AutoModel, 'from_pretrained').mockImplementation(
+      async () => {
+        if (corruptLoads > 0) {
+          corruptLoads -= 1
+          throw corrupt
+        }
+        return model('logits') as never
+      },
+    )
+    expect(await removeBackground(png)).toMatchObject({
+      model: 'birefnet-lite',
+      provider: 'wasm',
+    })
+    expect(entries.has(modelFile(LITE_MODEL))).toBe(false)
+    expect(load).toHaveBeenCalledTimes(2)
+
+    // A download that is corrupt every time is retried once, not forever.
+    clearModelCache()
+    corruptLoads = Number.POSITIVE_INFINITY
+    load.mockClear()
+    await expect(removeBackground(png)).rejects.toMatchObject({
+      code: 'model-load-failed',
+    })
+    expect(load).toHaveBeenCalledTimes(2)
+    await expect(removeBackground(png)).rejects.toMatchObject({
+      code: 'model-load-failed',
+    })
+    expect(load).toHaveBeenCalledTimes(2)
+  })
+
+  test('a cached model with the wrong size is ignored and removed', async () => {
+    const entries = installCaches(() => undefined)
+    entries.set(
+      modelFile(FULL_MODEL),
+      new Response('x', { headers: { 'content-length': '4096' } }),
+    )
+    const events: string[] = []
+    spyOn(AutoModel, 'from_pretrained').mockResolvedValue(
+      model('logits') as never,
+    )
+    await removeBackground(png, {
+      onProgress: (event) => events.push(event.message),
+    })
+    expect(entries.has(modelFile(FULL_MODEL))).toBe(false)
+    expect(events).not.toContain('Loading cached model…')
+  })
+
+  test('a failed cache write does not fail or delay the load', async () => {
+    installCaches(async () => {
+      throw new DOMException('Quota exceeded', 'QuotaExceededError')
+    })
+    spyOn(AutoModel, 'from_pretrained').mockImplementation(async () => {
+      const cache = env.customCache as {
+        put: (key: string, response: Response) => Promise<void>
+      }
+      await cache.put(modelFile(FULL_MODEL), new Response('model'))
+      return model() as never
+    })
+    expect((await removeBackground(png)).model).toBe('birefnet')
+  })
+
+  test('a Cache API that refuses to open falls back to IndexedDB', async () => {
+    Object.defineProperty(globalThis, 'caches', {
+      configurable: true,
+      value: {
+        open: async () => {
+          throw new DOMException('Cache storage is disabled', 'SecurityError')
+        },
+      },
+    })
+    const stored = new Map<string, Response>()
+    const available = spyOn(cacheModule, 'isIndexedDbAvailable')
+    available.mockReturnValue(true)
+    spyOn(cacheModule, 'createIndexedDbCache').mockReturnValue({
+      match: async (key) => stored.get(String(key))?.clone(),
+      put: async (key, response) => {
+        stored.set(String(key), response)
+      },
+      delete: async (key) => stored.delete(String(key)),
+    })
+    spyOn(AutoModel, 'from_pretrained').mockImplementation(async () => {
+      const cache = env.customCache as {
+        put: (key: string, response: Response) => Promise<void>
+      }
+      await cache.put(modelFile(FULL_MODEL), new Response('model'))
+      return model() as never
+    })
+    expect((await removeBackground(png)).model).toBe('birefnet')
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(stored.has(modelFile(FULL_MODEL))).toBe(true)
+    // clearModelCache runs before mocks are restored and would reach for a
+    // real IndexedDB, which this runtime does not have.
+    available.mockRestore()
+  })
+
+  test('network failures surface a useful error without disabling WebGPU', async () => {
+    let online = false
+    env.fetch = mock(async () => {
+      if (!online) throw new TypeError('Failed to fetch')
+      return new Response('ok')
+    })
+    const load = spyOn(AutoModel, 'from_pretrained').mockImplementation(
+      async (id) => {
+        await (
+          await env.fetch(`https://huggingface.co/${id}/config.json`)
+        ).arrayBuffer()
+        return model('logits') as never
+      },
+    )
+    await expect(removeBackground(png)).rejects.toMatchObject({
+      code: 'model-load-failed',
+      message:
+        'The local model could not be loaded. Check your connection and try again.',
+    })
+    // The lite file is shared by both runtimes, so it is not fetched twice,
+    // even though the WASM runtime files differ from the WebGPU ones.
+    expect(load.mock.calls.map((call) => [call[0], call[1]?.device])).toEqual([
+      [FULL_MODEL.id, 'webgpu'],
+      [LITE_MODEL.id, 'webgpu'],
+    ])
+    expect(storage.size).toBe(0)
+    online = true
+    expect(await removeBackground(png)).toMatchObject({
+      model: 'birefnet-lite',
+      provider: 'webgpu',
+    })
+  })
+
+  test('a failed WebGPU runtime file falls back to lite WASM', async () => {
+    let online = false
+    env.fetch = mock(async (input: RequestInfo | URL) => {
+      if (!online && String(input).includes('jsep')) {
+        throw new TypeError('Failed to fetch')
+      }
+      return new Response('ok')
+    })
+    const load = spyOn(AutoModel, 'from_pretrained').mockImplementation(
+      async (id, options) => {
+        await (
+          await env.fetch(`https://huggingface.co/${id}/config.json`)
+        ).arrayBuffer()
+        const runtime =
+          options?.device === 'webgpu'
+            ? 'ort-wasm-simd-threaded.jsep.wasm'
+            : 'ort-wasm-simd-threaded.wasm'
+        await (
+          await env.fetch(`https://cdn.jsdelivr.net/npm/ort/dist/${runtime}`)
+        ).arrayBuffer()
+        return model('logits') as never
+      },
+    )
+    expect(await removeBackground(png)).toMatchObject({
+      model: 'birefnet-lite',
+      provider: 'wasm',
+    })
+    // The model files were reachable, so only the GPU runtime is skipped.
+    expect(load.mock.calls.map((call) => [call[0], call[1]?.device])).toEqual([
+      [FULL_MODEL.id, 'webgpu'],
+      [LITE_MODEL.id, 'wasm'],
+    ])
+    expect(storage.size).toBe(0)
+    online = true
+    expect(await removeBackground(png)).toMatchObject({
+      model: 'birefnet',
+      provider: 'webgpu',
+    })
+  })
+
+  function stalledResponse() {
+    return new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(new Uint8Array(4))
+        },
+      }),
+    )
+  }
+
+  test('a stalled full-model download falls back to the lite model', async () => {
+    modelLoadTimings.stallMs = 20
+    env.fetch = mock(async () => stalledResponse())
+    spyOn(AutoModel, 'from_pretrained').mockImplementation(async (id) => {
+      if (id === FULL_MODEL.id) {
+        await (await env.fetch(modelFile(FULL_MODEL))).arrayBuffer()
+      }
+      return model('logits') as never
+    })
+    expect(await removeBackground(png)).toMatchObject({
+      model: 'birefnet-lite',
+      provider: 'webgpu',
+    })
+    expect(storage.size).toBe(0)
+  })
+
+  test('a download that stalls on every model ends with a retryable error', async () => {
+    modelLoadTimings.stallMs = 20
+    env.fetch = mock(async () => stalledResponse())
+    spyOn(AutoModel, 'from_pretrained').mockImplementation(async (id) => {
+      await (
+        await env.fetch(`https://huggingface.co/${id}/x.onnx`)
+      ).arrayBuffer()
+      return model('logits') as never
+    })
+    await expect(removeBackground(png)).rejects.toMatchObject({
+      code: 'model-load-failed',
+      message:
+        'The model download stopped responding. Check your connection and try again.',
+    })
+  })
+
+  test('a model that never finishes starting stops the walk and skips the full model next time', async () => {
+    modelLoadTimings.startMs = 20
+    const load = spyOn(AutoModel, 'from_pretrained').mockImplementation(
+      async (id, options) => {
+        if (id !== FULL_MODEL.id) return model('logits') as never
+        options?.progress_callback?.({
+          status: 'done',
+          name: id,
+          file: 'onnx/model_fp16.onnx',
+        })
+        return new Promise(() => undefined)
+      },
+    )
+    await expect(removeBackground(png)).rejects.toMatchObject({
+      code: 'model-load-failed',
+      message:
+        'The local model took too long to start. Reload the page and try again.',
+    })
+    expect(load).toHaveBeenCalledTimes(1)
+    expect(storage.has('bg0:full-model-blocked:v1')).toBe(true)
+    expect((await removeBackground(png)).model).toBe('birefnet-lite')
+  })
+
+  test('a tab that died during full-model work uses the lite model after reload', async () => {
+    const session = new Map([['bg0:full-model-running:v1', '1']])
+    Object.defineProperty(globalThis, 'sessionStorage', {
+      configurable: true,
+      value: {
+        getItem: (key: string) => session.get(key) ?? null,
+        setItem: (key: string, value: string) => session.set(key, value),
+        removeItem: (key: string) => session.delete(key),
+      },
+    })
+    const load = spyOn(AutoModel, 'from_pretrained').mockResolvedValue(
+      model('logits') as never,
+    )
+    expect((await removeBackground(png)).model).toBe('birefnet-lite')
+    expect(load.mock.calls[0][0]).toBe(LITE_MODEL.id)
+    expect(session.size).toBe(0)
+  })
+
+  test('cancelling stops waiting on a model that is still loading', async () => {
+    modelLoadTimings.startMs = 200
+    spyOn(AutoModel, 'from_pretrained').mockImplementation(
+      () => new Promise(() => undefined),
+    )
+    const controller = new AbortController()
+    const pending = removeBackground(png, { signal: controller.signal })
+    setTimeout(() => controller.abort(), 10)
+    const startedAt = performance.now()
+    await expect(pending).rejects.toMatchObject({ code: 'cancelled' })
+    expect(performance.now() - startedAt).toBeLessThan(150)
+  })
+
+  test('a load that fails after every caller cancelled is not reused', async () => {
+    let failFirst: ((error: Error) => void) | undefined
+    const load = spyOn(AutoModel, 'from_pretrained').mockImplementation(
+      (() => {
+        if (!failFirst) {
+          return new Promise((_resolve, reject) => {
+            failFirst = reject
+          })
+        }
+        return Promise.resolve(model())
+      }) as never,
+    )
+    const controller = new AbortController()
+    const pending = removeBackground(png, { signal: controller.signal })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    controller.abort()
+    await expect(pending).rejects.toMatchObject({ code: 'cancelled' })
+    failFirst?.(new Error('device lost'))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    // The next image starts a fresh load of the same model instead of
+    // inheriting the failure and falling back.
+    expect((await removeBackground(png)).model).toBe('birefnet')
+    expect(load.mock.calls.map((call) => call[0])).toEqual([
+      FULL_MODEL.id,
+      FULL_MODEL.id,
+    ])
+  })
+
+  test('reports downloaded bytes and the runtime while the model downloads', async () => {
+    spyOn(AutoModel, 'from_pretrained').mockImplementation(
+      async (id, options) => {
+        options?.progress_callback?.({
+          status: 'progress',
+          name: id,
+          file: 'onnx/model_fp16.onnx',
+          progress: 40,
+          loaded: 40_000_000,
+          total: 100_000_000,
+        })
+        return model() as never
+      },
+    )
+    const events: Parameters<
+      NonNullable<Parameters<typeof removeBackground>[1]>['onProgress'] & object
+    >[0][] = []
+    await removeBackground(png, { onProgress: (event) => events.push(event) })
+    const downloading = events.find((event) => event.stage === 'downloading')
+    expect(downloading).toMatchObject({
+      message: 'Downloading local model…',
+      provider: 'webgpu',
+      download: { loadedBytes: 40_000_000 },
+    })
+    expect(downloading?.download?.totalBytes).toBeGreaterThanOrEqual(
+      100_000_000,
+    )
+    expect(
+      events.filter((event) => event.stage !== 'downloading' && event.download),
+    ).toEqual([])
+  })
+})
+
 describe('HEIC sources', () => {
   // ftyp box: size 16, 'ftyp', major 'heic', minor 0.
   const heic = new Blob(
@@ -462,9 +884,9 @@ describe('HEIC sources', () => {
       expect.any(Number),
       'png',
     )
-    expect(
-      (image.maskToPng as ReturnType<typeof spyOn>).mock.calls[0][0],
-    ).toBe(pngBitmap)
+    expect((image.maskToPng as ReturnType<typeof spyOn>).mock.calls[0][0]).toBe(
+      pngBitmap,
+    )
     expect(heicBitmap.close).toHaveBeenCalledTimes(1)
     expect(pngBitmap.close).toHaveBeenCalledTimes(2)
     expect(result.sourceBlob).toBe(transcoded)
