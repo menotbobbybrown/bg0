@@ -20,7 +20,7 @@ export const Route = createFileRoute('/privacy')({
 
 function Privacy() {
   return (
-    <LegalPage title="Privacy" updated="September 14, 2026">
+    <LegalPage title="Privacy" updated="September 25, 2026">
       <p>
         BG0 removes image backgrounds on your own device. This page explains
         exactly what leaves your browser when you use bg0.dev, which is very
@@ -48,18 +48,26 @@ function Privacy() {
       <p>
         bg0.dev uses PostHog for anonymous, first-party product and web
         analytics. We record page routes and a small set of actions: choosing an
-        image, whether local removal succeeded, the browser engine used,
-        downloading or copying a result, and using result views. We never send
-        image contents or image metadata to PostHog. Session recording,
-        advertising, fingerprinting, and automatic click capture are disabled.
+        image, whether local removal succeeded, the browser engine used, roughly
+        how long removal took (such as "5-15s"), downloading or copying a
+        result, and using result views. We never send image contents or image
+        metadata to PostHog. Session recording, advertising, fingerprinting, and
+        automatic click capture are disabled.
       </p>
       <p>
-        We also use PostHog to collect multiple-choice survey answers you choose
-        to submit and to report app errors. Surveys do not accept free text.
-        Error reports include a controlled error category and safe application
-        code locations, without the original error text, image URLs, image
-        contents, or image metadata. Survey responses and error reports use the
-        same anonymous identifier as the analytics above.
+        We also use PostHog to collect survey answers you choose to submit and
+        to report app errors. Surveys are multiple choice, plus one optional
+        short text answer that only appears after you rate a result poorly.
+        Before that text is sent, your browser shortens it to 500 characters and
+        replaces email addresses, links, image filenames and sizes, and long
+        numbers such as phone numbers.
+        Please don't include personal details. One question asks what kind of
+        image you used, such as a product or a pet. That is the category you
+        pick; we never work it out from the image. Error reports include a
+        controlled error category and safe application code locations, without
+        the original error text, image URLs, image contents, or image metadata.
+        Survey responses and error reports use the same anonymous identifier as
+        the analytics above.
       </p>
       <p>
         PostHog stores a random anonymous identifier in local storage so visits

@@ -234,6 +234,7 @@ export function Remover({
   const process = useCallback(
     async (file: File, inputMethod: InputMethod, emitAnalytics = true) => {
       if (emitAnalytics) captureImageSelected(inputMethod)
+      const startedAt = performance.now()
 
       abortController.current?.abort()
       cleanupUrls(latestState.current)
@@ -309,7 +310,11 @@ export function Remover({
         setAnnouncement(
           `Background removed in ${(result.durationMs / 1000).toFixed(1)} seconds.`,
         )
-        captureRemovalSucceeded(inputMethod, result.provider)
+        captureRemovalSucceeded(
+          inputMethod,
+          result.provider,
+          performance.now() - startedAt,
+        )
         showResultSurvey()
         lastFile.current = null
       } catch (error) {
