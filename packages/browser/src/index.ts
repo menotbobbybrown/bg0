@@ -12,6 +12,7 @@ import {
   ModelStartTimeoutError,
   modelLoadTimings,
 } from './download'
+import { createFailureEvictions } from './eviction'
 import { BackgroundRemovalError, normalizeError } from './errors'
 import {
   blockFullModel,
@@ -140,9 +141,9 @@ type EngineLoad = {
 const MODEL_CACHE_NAME = 'transformers-cache'
 const engineLoads = new Map<string, EngineLoad>()
 const failedEngines = new Set<string>()
-// Evictions of corrupt cached models still in progress. Callers that shared
-// the failed load wait for the same eviction before retrying.
-const pendingEvictions = new Map<string, Promise<void>>()
+// A damaged cached model is evicted once per failed load, however many
+// callers shared it.
+const evictCorruptLoad = createFailureEvictions(evictCachedModel)
 let detectedChoices: Promise<EngineChoice[]> | undefined
 let webgpuUsableForSession = true
 
@@ -163,7 +164,6 @@ export function clearModelCache(): void {
   }
   engineLoads.clear()
   failedEngines.clear()
-  pendingEvictions.clear()
   detectedChoices = undefined
   webgpuUsableForSession = true
   modelCache = undefined
@@ -492,17 +492,7 @@ async function getPreferredEngine(
         // A damaged cached file fails every later load until it is replaced.
         // Retry once with a fresh download: for lite WASM there is no later
         // choice. A download that is corrupt again is not fetched a third time.
-        let evicted = pendingEvictions.get(key)
-        if (!evicted) {
-          evicted = evictCachedModel(choice.definition)
-          pendingEvictions.set(key, evicted)
-          const settled = evicted
-          void settled.finally(() => {
-            if (pendingEvictions.get(key) === settled)
-              pendingEvictions.delete(key)
-          })
-        }
-        await evicted
+        await evictCorruptLoad(choice.definition, error)
         throwIfCancelled(signal)
         if (reloaded.has(key)) {
           failedEngines.add(key)
