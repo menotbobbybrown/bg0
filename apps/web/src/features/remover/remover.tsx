@@ -247,6 +247,8 @@ export function Remover({
 
       const replacing = latestState.current.status === 'result'
       const replacingUnsaved = replacing && !resultSavedRef.current
+      // Replacing a result directly starts another image, like Start over.
+      if (replacing && emitAnalytics) captureFeatureUsed('start_another_image')
       abortController.current?.abort()
       cleanupUrls(latestState.current)
       const sourceUrl = URL.createObjectURL(file)
@@ -434,12 +436,13 @@ export function Remover({
       // A new image may have replaced this result while the write was
       // pending. The clipboard holds the old PNG, so the new one stays unsaved.
       const shown = latestState.current
+      // Announcing it then would also replace the new image's status.
       if (shown.status === 'result' && shown.resultUrl === current.resultUrl) {
         setCopied(true)
         setResultSaved(true)
         window.setTimeout(() => setCopied(false), 1600)
+        notify('PNG copied to the clipboard')
       }
-      notify('PNG copied to the clipboard')
       captureFeatureUsed('copy_result')
     } catch {
       notify('Clipboard blocked by the browser. Download instead.', 'error')
@@ -898,7 +901,7 @@ export function Remover({
 
         {state.status !== 'idle' && (
           <div
-            aria-hidden="true"
+            aria-hidden={!isDragging}
             data-testid="replace-drop-overlay"
             data-visible={isDragging}
             className={cn(

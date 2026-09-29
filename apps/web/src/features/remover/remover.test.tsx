@@ -678,6 +678,8 @@ describe('Remover result screen', () => {
         false,
       )
       expect(overlay.getAttribute('data-visible')).toBe('true')
+      // Screen readers can read the replacement warning while it is shown.
+      expect(overlay.getAttribute('aria-hidden')).toBe('false')
       expect(overlay.textContent).toContain('Release to remove the background')
       expect(overlay.textContent).toContain('has not been downloaded')
 
@@ -784,6 +786,7 @@ describe('Remover result screen', () => {
       expect(
         view.getByRole('button', { name: /^Copy/ }).textContent,
       ).not.toContain('Copied')
+      expect(view.queryByText('PNG copied to the clipboard')).toBeNull()
 
       selectFile(view, new File(['three'], 'three.png', { type: 'image/png' }))
       await waitFor(() => expect(remove).toHaveBeenCalledTimes(3))
