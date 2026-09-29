@@ -93,11 +93,19 @@ afterEach(async () => {
   }
 })
 
-/** Reports load progress, which later callers of the same load receive on joining. */
+/**
+ * Opens the model file and reports load progress, which later callers of the
+ * same load receive on joining.
+ */
 function reportLoadProgress(
   id: string,
   options?: { progress_callback?: (event: never) => void },
 ) {
+  options?.progress_callback?.({
+    status: 'download',
+    name: id,
+    file: 'onnx/model_fp16.onnx',
+  } as never)
   options?.progress_callback?.({
     status: 'progress',
     name: id,
@@ -651,6 +659,7 @@ describe('model load recovery', () => {
         return model('logits') as never
       },
     )
+    const deletes = spyOn(entries, 'delete')
     const shared = sharedLoad(2)
     const running = Promise.all([
       removeBackground(png, { onProgress: shared.caller() }),
@@ -664,6 +673,10 @@ describe('model load recovery', () => {
       expect(result).toMatchObject({ model: 'birefnet-lite', provider: 'wasm' })
     }
     expect(load).toHaveBeenCalledTimes(2)
+    // Both callers read the same copy, so it is deleted once.
+    expect(
+      deletes.mock.calls.filter(([key]) => key === modelFile(LITE_MODEL)),
+    ).toHaveLength(1)
   })
 
   test('a shared corrupt load keeps the retry download in the cache', async () => {

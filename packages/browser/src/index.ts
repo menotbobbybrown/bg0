@@ -135,8 +135,11 @@ type EngineLoad = {
   progress?: EngineProgress
   users: number
   retired: boolean
-  /** The cached copy of the model this load read, for eviction. */
-  copy: number
+  /**
+   * The cached copy of the model this load read, for eviction. Unset until
+   * the load has opened its model file.
+   */
+  copy?: number
   disposal?: Promise<void>
 }
 
@@ -639,15 +642,20 @@ async function getEngine(
   if (!load) {
     const listeners: EngineLoad['listeners'] = new Set()
     let currentLoad: EngineLoad
-    const copy = corruptModels.begin(choice.definition)
-    const promise = loadEngine(choice, (progress) => {
-      if (engineLoads.get(key) !== currentLoad) return
-      currentLoad.progress = progress
-      for (const listener of currentLoad.listeners) {
-        notifyEngineProgress(listener, progress)
-      }
-    })
-    currentLoad = { promise, listeners, users: 0, retired: false, copy }
+    const promise = loadEngine(
+      choice,
+      (progress) => {
+        if (engineLoads.get(key) !== currentLoad) return
+        currentLoad.progress = progress
+        for (const listener of currentLoad.listeners) {
+          notifyEngineProgress(listener, progress)
+        }
+      },
+      () => {
+        currentLoad.copy ??= corruptModels.begin(choice.definition)
+      },
+    )
+    currentLoad = { promise, listeners, users: 0, retired: false }
     load = currentLoad
     engineLoads.set(key, load)
     // A failed load must not be reused, even when every caller cancelled
@@ -906,6 +914,20 @@ function superviseFetch(env: TransformersEnv): TransformersEnv['fetch'] {
   return baseFetch
 }
 
+function isModelFileOpened(
+  event: unknown,
+  definition: ModelDefinition,
+): boolean {
+  if (typeof event !== 'object' || event === null) return false
+  const { status, name, file } = event as Record<string, unknown>
+  return (
+    status === 'download' &&
+    name === definition.id &&
+    typeof file === 'string' &&
+    modelUrl(definition).endsWith(`/${file}`)
+  )
+}
+
 function isModelFileUrl(url: string, definition?: ModelDefinition): boolean {
   const definitions = definition ? [definition] : [LITE_MODEL, FULL_MODEL]
   return definitions.some((entry) => url.includes(`/${entry.id}/`))
@@ -926,6 +948,7 @@ function configureModelCache(env: TransformersEnv): void {
 async function loadEngine(
   choice: EngineChoice,
   onDownload: EngineProgressListener,
+  onModelFileOpened: () => void,
 ): Promise<Engine> {
   const { provider, definition } = choice
   const { AutoModel, AutoProcessor, env } = await import(
@@ -955,6 +978,9 @@ async function loadEngine(
   )
   const trackedProgress = (event: unknown) => {
     watch.touch()
+    // Transformers.js reports `download` as soon as it has chosen between the
+    // cache and the network, before any other load can evict what it chose.
+    if (isModelFileOpened(event, definition)) onModelFileOpened()
     progressCallback(event)
   }
 

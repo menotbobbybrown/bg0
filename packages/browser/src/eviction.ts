@@ -1,13 +1,14 @@
 /**
  * Evict a damaged cached file once per copy that failed.
  *
- * Every load records which copy of its file it reads with `begin`. Loads of
- * one file on different providers, and every caller that shared a load, may
- * all fail on the same damaged copy. The first failure evicts it; the rest
- * share that eviction instead of evicting again, because by then a retry may
- * be writing a fresh download and a second eviction would delete it. A load
- * that began after the eviction read a newer copy, so its failure evicts
- * again. A failure without a recorded copy always evicts.
+ * Every load records which copy of its file it read by calling `begin` when
+ * it opens that file. Loads of one file on different providers, and every
+ * caller that shared a load, may all fail on the same damaged copy. The first
+ * failure evicts it; the rest share that eviction instead of evicting again,
+ * because by then a retry may be writing a fresh download and a second
+ * eviction would delete it. A load that opened its file after the eviction
+ * read a newer copy, so its failure evicts again. A failure without a
+ * recorded copy always evicts.
  */
 export function createFailureEvictions<T>(
   evict: (target: T) => Promise<void>,
