@@ -1,5 +1,15 @@
-import { describe, expect, mock, test } from 'bun:test'
 import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  spyOn,
+  test,
+} from 'bun:test'
+import { IDBFactory } from 'fake-indexeddb'
+import {
+  clearIndexedDbCache,
   createIndexedDbCache,
   createSafeCache,
   lastReaderOf,
@@ -360,56 +370,59 @@ describe('safe model cache', () => {
 })
 
 describe('IndexedDB model cache', () => {
-  test('closes its connection when a reset deletes the database', async () => {
-    const connections: {
-      close: ReturnType<typeof mock>
-      onversionchange: (() => void) | null
-    }[] = []
-    const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'indexedDB')
+  let descriptor: PropertyDescriptor | undefined
+  let warn: ReturnType<typeof spyOn> | undefined
+
+  beforeEach(() => {
+    descriptor = Object.getOwnPropertyDescriptor(globalThis, 'indexedDB')
     Object.defineProperty(globalThis, 'indexedDB', {
       configurable: true,
-      value: {
-        open: () => {
-          const connection = {
-            close: mock(() => undefined),
-            onversionchange: null as (() => void) | null,
-            objectStoreNames: { contains: () => true },
-            transaction: () => ({
-              objectStore: () => ({
-                get: () => {
-                  // Every key reads as missing.
-                  const read = {
-                    result: undefined,
-                    onsuccess: null as (() => void) | null,
-                  }
-                  setTimeout(() => read.onsuccess?.(), 0)
-                  return read
-                },
-              }),
-            }),
-          }
-          connections.push(connection)
-          const open = {
-            result: connection,
-            onsuccess: null as (() => void) | null,
-          }
-          setTimeout(() => open.onsuccess?.(), 0)
-          return open
-        },
-      },
+      value: new IDBFactory(),
     })
-    try {
-      const cache = createIndexedDbCache()
-      expect(await cache.match(url)).toBeUndefined()
-      expect(connections).toHaveLength(1)
-      connections[0]?.onversionchange?.()
-      expect(connections[0]?.close).toHaveBeenCalledTimes(1)
-      // The next read opens a new connection.
-      expect(await cache.match(url)).toBeUndefined()
-      expect(connections).toHaveLength(2)
-    } finally {
-      if (descriptor) Object.defineProperty(globalThis, 'indexedDB', descriptor)
-      else Reflect.deleteProperty(globalThis, 'indexedDB')
-    }
+    // A write through a reset cache is dropped with a warning.
+    warn = spyOn(console, 'warn').mockImplementation(() => undefined)
+  })
+
+  afterEach(() => {
+    warn?.mockRestore()
+    if (descriptor) Object.defineProperty(globalThis, 'indexedDB', descriptor)
+    else Reflect.deleteProperty(globalThis, 'indexedDB')
+  })
+
+  test('a reset deletes stored models', async () => {
+    const cache = createIndexedDbCache()
+    await cache.put(url, sized(4))
+    expect((await cache.match(url))?.headers.get('content-length')).toBe('4')
+    await clearIndexedDbCache()
+    expect(await createIndexedDbCache().match(url)).toBeUndefined()
+  })
+
+  test('a load from before a reset cannot write the model back', async () => {
+    const old = createIndexedDbCache()
+    expect(await old.match(url)).toBeUndefined()
+    await clearIndexedDbCache()
+    await old.put(url, sized(4))
+    expect(await old.match(url)).toBeUndefined()
+    expect(await createIndexedDbCache().match(url)).toBeUndefined()
+  })
+
+  test('a cache created before a reset stays empty after it', async () => {
+    const old = createIndexedDbCache()
+    await clearIndexedDbCache()
+    await old.put(url, sized(4))
+    expect(await createIndexedDbCache().match(url)).toBeUndefined()
+  })
+
+  test("another tab's reset closes the connection for good", async () => {
+    const old = createIndexedDbCache()
+    await old.put(url, sized(4))
+    await new Promise<void>((resolve, reject) => {
+      const deletion = indexedDB.deleteDatabase('bg0-model-cache')
+      deletion.onsuccess = () => resolve()
+      deletion.onerror = () => reject(deletion.error)
+      deletion.onblocked = () => reject(new Error('blocked'))
+    })
+    await old.put(url, sized(4))
+    expect(await createIndexedDbCache().match(url)).toBeUndefined()
   })
 })
