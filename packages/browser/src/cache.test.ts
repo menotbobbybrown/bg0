@@ -110,4 +110,37 @@ describe('safe model cache', () => {
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(await cache.match(url)).toBeInstanceOf(Response)
   })
+
+  test('a write that starts during an eviction survives it', async () => {
+    const entries = new Map<string, Response>()
+    let finishFirstWrite: () => void = () => undefined
+    let writes = 0
+    const inner: ModelCache = {
+      match: async (key) => entries.get(String(key)),
+      put: async (key, response) => {
+        writes += 1
+        if (writes === 1) {
+          await new Promise<void>((resolve) => {
+            finishFirstWrite = resolve
+          })
+        }
+        entries.set(String(key), response)
+      },
+      delete: async (key) => entries.delete(String(key)),
+    }
+    const cache = createSafeCache(async () => inner)
+    await cache.put(url, sized(4))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    // The eviction waits for the first write; a fresh download starts meanwhile.
+    const evicted = cache.delete(url)
+    await cache.put(url, sized(4))
+    finishFirstWrite()
+    await evicted
+    for (let i = 0; i < 5; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+    expect(entries.has(url)).toBe(true)
+    expect(await cache.match(url)).toBeInstanceOf(Response)
+  })
 })

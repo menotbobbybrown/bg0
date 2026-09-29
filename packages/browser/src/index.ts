@@ -12,6 +12,7 @@ import {
   ModelStartTimeoutError,
   modelLoadTimings,
 } from './download'
+import { createFailureEvictions } from './eviction'
 import { BackgroundRemovalError, normalizeError } from './errors'
 import {
   blockFullModel,
@@ -140,8 +141,9 @@ type EngineLoad = {
 const MODEL_CACHE_NAME = 'transformers-cache'
 const engineLoads = new Map<string, EngineLoad>()
 const failedEngines = new Set<string>()
-// Engines already retried once after their cached model was evicted as corrupt.
-const reloadedEngines = new Set<string>()
+// A damaged cached model is evicted once per failed load, however many
+// callers shared it.
+const evictCorruptLoad = createFailureEvictions(evictCachedModel)
 let detectedChoices: Promise<EngineChoice[]> | undefined
 let webgpuUsableForSession = true
 
@@ -162,7 +164,6 @@ export function clearModelCache(): void {
   }
   engineLoads.clear()
   failedEngines.clear()
-  reloadedEngines.clear()
   detectedChoices = undefined
   webgpuUsableForSession = true
   modelCache = undefined
@@ -444,6 +445,8 @@ async function getPreferredEngine(
   const unreachableModels = new Set<string>()
   // Runtime files differ per provider, so their failure only skips that one.
   const unreachableProviders = new Set<ExecutionProvider>()
+  // Engines this walk already reloaded after a corrupt cached model.
+  const reloaded = new Set<string>()
   const queue = [...choices]
   for (let index = 0; index < queue.length; index += 1) {
     const choice = queue[index]
@@ -487,15 +490,15 @@ async function getPreferredEngine(
       }
       if (isCorruptModelError(error)) {
         // A damaged cached file fails every later load until it is replaced.
-        await evictCachedModel(choice.definition)
-        throwIfCancelled(signal)
         // Retry once with a fresh download: for lite WASM there is no later
         // choice. A download that is corrupt again is not fetched a third time.
-        if (!reloadedEngines.has(key)) {
-          reloadedEngines.add(key)
-          queue.splice(index + 1, 0, choice)
-        } else {
+        await evictCorruptLoad(choice.definition, error)
+        throwIfCancelled(signal)
+        if (reloaded.has(key)) {
           failedEngines.add(key)
+        } else {
+          reloaded.add(key)
+          queue.splice(index + 1, 0, choice)
         }
         continue
       }
@@ -564,7 +567,11 @@ function getModelCache(): ReturnType<typeof createSafeCache> | undefined {
 }
 
 async function evictCachedModel(model: ModelDefinition): Promise<void> {
-  await getModelCache()?.delete(modelUrl(model))
+  try {
+    await getModelCache()?.delete(modelUrl(model))
+  } catch {
+    // The retry still runs; a failed delete means it may read the old file.
+  }
 }
 
 async function isModelCached(model: ModelDefinition): Promise<boolean> {

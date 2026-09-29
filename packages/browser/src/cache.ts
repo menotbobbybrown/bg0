@@ -208,7 +208,8 @@ export async function clearIndexedDbCache(): Promise<void> {
  * A model can be rejected and evicted before its own background write lands.
  * Eviction therefore reads the key as a miss until every write already in
  * flight has settled, then deletes it again, so a late write cannot restore
- * the evicted file.
+ * the evicted file. A write that starts during that wait is held until the
+ * delete finishes, so the delete cannot remove it.
  */
 export function createSafeCache(
   open: () => Promise<ModelCache | undefined>,
@@ -265,8 +266,12 @@ export function createSafeCache(
     },
     async put(input, response) {
       const key = keyOf(input)
+      // A write that starts during an eviction lands after its delete, so the
+      // delete cannot remove this newer copy.
+      const blocker = evicting.get(key)
       const write = (async () => {
         try {
+          if (blocker) await blocker
           await (await cache())?.put(input, response)
         } catch {
           // Caching is an optimization. The model is already in memory.

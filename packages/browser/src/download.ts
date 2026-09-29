@@ -58,7 +58,9 @@ export const defaultTimers: Timers = {
  * Limits for one model-load attempt. A healthy connection delivers a chunk
  * every few hundred milliseconds, so 30 seconds without one means the
  * download is stuck. Starting the full model on a slow CPU can take a minute,
- * so initialization gets a wider limit. Mutable so tests can shorten them.
+ * so initialization gets a wider limit. Both are idle limits, not total
+ * deadlines: any progress restarts them, so a slow download that keeps moving
+ * is never cut off. Mutable so tests can shorten them.
  */
 export const modelLoadTimings = {
   stallMs: 30_000,
