@@ -544,6 +544,44 @@ describe('model load recovery', () => {
     expect(load).toHaveBeenCalledTimes(2)
   })
 
+  test('a corrupt retry is evicted even when it reuses the error object', async () => {
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: { userAgent: 'Firefox/150.0' },
+    })
+    const entries = installCaches(() => undefined)
+    entries.set(
+      modelFile(LITE_MODEL),
+      new Response('x', {
+        headers: { 'content-length': String(LITE_MODEL.bytes) },
+      }),
+    )
+    const corrupt = new Error(
+      "Can't create a session. ERROR_CODE: 7, ERROR_MESSAGE: Failed to load model because protobuf parsing failed.",
+    )
+    spyOn(AutoModel, 'from_pretrained').mockImplementation(async () => {
+      if (!entries.has(modelFile(LITE_MODEL))) {
+        // The retry downloads and caches a file that is corrupt too.
+        const cache = env.customCache as {
+          put: (key: string, response: Response) => Promise<void>
+        }
+        await cache.put(
+          modelFile(LITE_MODEL),
+          new Response('y', {
+            headers: { 'content-length': String(LITE_MODEL.bytes) },
+          }),
+        )
+        await new Promise((resolve) => setTimeout(resolve, 0))
+      }
+      throw corrupt
+    })
+    await expect(removeBackground(png)).rejects.toMatchObject({
+      code: 'model-load-failed',
+    })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(entries.has(modelFile(LITE_MODEL))).toBe(false)
+  })
+
   test('callers sharing a corrupt load both get the one retry', async () => {
     Object.defineProperty(globalThis, 'navigator', {
       configurable: true,

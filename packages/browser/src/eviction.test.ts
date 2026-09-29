@@ -2,25 +2,25 @@ import { describe, expect, mock, test } from 'bun:test'
 import { createFailureEvictions } from './eviction'
 
 describe('failure evictions', () => {
-  test('a caller that handles the same failure later does not evict again', async () => {
+  test('a caller that handles the same load later does not evict again', async () => {
     const evict = mock(async (_target: string) => undefined)
     const evictFor = createFailureEvictions(evict)
-    const failure = new Error('corrupt')
-    await evictFor('lite', failure)
+    const load = {}
+    await evictFor('lite', load)
     // The retry is now writing a fresh download.
-    await evictFor('lite', failure)
+    await evictFor('lite', load)
     expect(evict).toHaveBeenCalledTimes(1)
   })
 
-  test('a new failure evicts again', async () => {
+  test('a new load evicts again', async () => {
     const evict = mock(async (_target: string) => undefined)
     const evictFor = createFailureEvictions(evict)
-    await evictFor('lite', new Error('corrupt'))
-    await evictFor('lite', new Error('corrupt again'))
+    await evictFor('lite', {})
+    await evictFor('lite', {})
     expect(evict).toHaveBeenCalledTimes(2)
   })
 
-  test('a failure that is not an object always evicts', async () => {
+  test('a load that is not an object always evicts', async () => {
     const evict = mock(async (_target: string) => undefined)
     const evictFor = createFailureEvictions(evict)
     await evictFor('lite', 'corrupt')

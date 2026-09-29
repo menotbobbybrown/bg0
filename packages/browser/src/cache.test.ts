@@ -143,4 +143,32 @@ describe('safe model cache', () => {
     expect(entries.has(url)).toBe(true)
     expect(await cache.match(url)).toBeInstanceOf(Response)
   })
+
+  test('a write stuck behind a slow eviction is dropped', async () => {
+    let finishFirst: () => void = () => undefined
+    const put = mock(
+      (_key: RequestInfo | URL, _response: Response) =>
+        new Promise<void>((resolve) => {
+          finishFirst = resolve
+        }),
+    )
+    const cache = createSafeCache(
+      async () => ({
+        match: async () => undefined,
+        put,
+        delete: async () => true,
+      }),
+      () => undefined,
+      10,
+    )
+    // The first write outlasts the wait, so its eviction does too.
+    await cache.put(url, sized(4))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    await cache.delete(url)
+    await cache.put(url, sized(4))
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    finishFirst()
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(put).toHaveBeenCalledTimes(1)
+  })
 })
