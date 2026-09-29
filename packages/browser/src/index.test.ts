@@ -13,6 +13,7 @@ import {
   env,
   Tensor,
 } from '@huggingface/transformers'
+import * as cacheModule from './cache'
 import { modelLoadTimings } from './download'
 import * as image from './image'
 import {
@@ -574,6 +575,40 @@ describe('model load recovery', () => {
     expect((await removeBackground(png)).model).toBe('birefnet')
   })
 
+  test('a Cache API that refuses to open falls back to IndexedDB', async () => {
+    Object.defineProperty(globalThis, 'caches', {
+      configurable: true,
+      value: {
+        open: async () => {
+          throw new DOMException('Cache storage is disabled', 'SecurityError')
+        },
+      },
+    })
+    const stored = new Map<string, Response>()
+    const available = spyOn(cacheModule, 'isIndexedDbAvailable')
+    available.mockReturnValue(true)
+    spyOn(cacheModule, 'createIndexedDbCache').mockReturnValue({
+      match: async (key) => stored.get(String(key))?.clone(),
+      put: async (key, response) => {
+        stored.set(String(key), response)
+      },
+      delete: async (key) => stored.delete(String(key)),
+    })
+    spyOn(AutoModel, 'from_pretrained').mockImplementation(async () => {
+      const cache = env.customCache as {
+        put: (key: string, response: Response) => Promise<void>
+      }
+      await cache.put(modelFile(FULL_MODEL), new Response('model'))
+      return model() as never
+    })
+    expect((await removeBackground(png)).model).toBe('birefnet')
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(stored.has(modelFile(FULL_MODEL))).toBe(true)
+    // clearModelCache runs before mocks are restored and would reach for a
+    // real IndexedDB, which this runtime does not have.
+    available.mockRestore()
+  })
+
   test('network failures surface a useful error without disabling WebGPU', async () => {
     let online = false
     env.fetch = mock(async () => {
@@ -741,6 +776,35 @@ describe('model load recovery', () => {
     const startedAt = performance.now()
     await expect(pending).rejects.toMatchObject({ code: 'cancelled' })
     expect(performance.now() - startedAt).toBeLessThan(150)
+  })
+
+  test('a load that fails after every caller cancelled is not reused', async () => {
+    let failFirst: ((error: Error) => void) | undefined
+    const load = spyOn(AutoModel, 'from_pretrained').mockImplementation(
+      (() => {
+        if (!failFirst) {
+          return new Promise((_resolve, reject) => {
+            failFirst = reject
+          })
+        }
+        return Promise.resolve(model())
+      }) as never,
+    )
+    const controller = new AbortController()
+    const pending = removeBackground(png, { signal: controller.signal })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    controller.abort()
+    await expect(pending).rejects.toMatchObject({ code: 'cancelled' })
+    failFirst?.(new Error('device lost'))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    // The next image starts a fresh load of the same model instead of
+    // inheriting the failure and falling back.
+    expect((await removeBackground(png)).model).toBe('birefnet')
+    expect(load.mock.calls.map((call) => call[0])).toEqual([
+      FULL_MODEL.id,
+      FULL_MODEL.id,
+    ])
   })
 
   test('reports downloaded bytes and the runtime while the model downloads', async () => {

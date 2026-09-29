@@ -546,11 +546,17 @@ function getModelCache(): ReturnType<typeof createSafeCache> | undefined {
   // The Cache API only exists in secure contexts. Fall back to IndexedDB so
   // the model is still cached on plain-http previews and older browsers.
   let open: (() => Promise<ModelCache | undefined>) | undefined
+  const indexedDb = isIndexedDbAvailable() ? createIndexedDbCache() : undefined
   if (typeof caches !== 'undefined') {
-    open = () => caches.open(MODEL_CACHE_NAME)
-  } else if (isIndexedDbAvailable()) {
-    const cache = createIndexedDbCache()
-    open = async () => cache
+    // Some browsers expose the Cache API but reject opening it, for example
+    // in private windows. IndexedDB may still work there.
+    open = () =>
+      caches.open(MODEL_CACHE_NAME).catch((error: unknown) => {
+        if (indexedDb) return indexedDb
+        throw error
+      })
+  } else if (indexedDb) {
+    open = async () => indexedDb
   }
   if (!open) return undefined
   modelCache = createSafeCache(open, expectedModelBytes)
@@ -629,6 +635,11 @@ async function getEngine(
     currentLoad = { promise, listeners, users: 0, retired: false }
     load = currentLoad
     engineLoads.set(key, load)
+    // A failed load must not be reused, even when every caller cancelled
+    // before it settled and nobody is left to evict it.
+    promise.catch(() => {
+      if (engineLoads.get(key) === currentLoad) engineLoads.delete(key)
+    })
   }
 
   // Reserve before awaiting initialization or notifying callers: a cache reset

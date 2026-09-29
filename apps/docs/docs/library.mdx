@@ -14,6 +14,12 @@ sidebar:
 npm i @bg0/browser
 ```
 
+### Recover after a failed model load
+
+Transformers.js 4.3.0 queues every ONNX session load and inference call behind the previous one. When one of them fails, every later load in the page fails too, so BG0 cannot fall back from WebGPU to WebAssembly or try again without a reload. bg0.dev ships with [a small patch](https://github.com/opencoredev/bg0/blob/main/patches/%40huggingface%252Ftransformers%404.3.0.patch) that lets the queue continue after a failure. npm does not apply it for you.
+
+Without the patch, a working load is unaffected. After a failed load, ask the user to reload the page. To get the same recovery as bg0.dev, pin `@huggingface/transformers` to `4.3.0` and apply the patch with your package manager, for example Bun's `patchedDependencies` or `patch-package`.
+
 ## Remove a background
 
 ```ts
