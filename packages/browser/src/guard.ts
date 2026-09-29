@@ -114,7 +114,10 @@ function checkMarker(
   const check = (async () => {
     const crashed = !(await lockIsHeld(locks, marker))
     try {
-      session()?.removeItem(RUNNING_KEY)
+      // A run that started meanwhile wrote its own marker; keep that one.
+      if (session()?.getItem(RUNNING_KEY) === marker) {
+        session()?.removeItem(RUNNING_KEY)
+      }
     } catch {
       // The block below still applies.
     }

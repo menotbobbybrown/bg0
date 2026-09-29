@@ -168,4 +168,27 @@ describe('full model guard', () => {
     expect(session.size).toBe(0)
     expect(await isFullModelBlocked(1000, slowLocks)).toBe(true)
   })
+
+  test('a run that starts during a check keeps its own marker', async () => {
+    const { locks } = fakeLocks()
+    let answer: () => void = () => undefined
+    const slowLocks = {
+      ...locks,
+      query: async () => {
+        await new Promise<void>((resolve) => {
+          answer = resolve
+        })
+        return locks.query()
+      },
+    } as typeof locks
+    session.set('bg0:full-model-running:v1', 'copied-run')
+    const check = isFullModelBlocked(1000, slowLocks)
+    const settle = markFullModelRunning(locks)
+    const current = session.get('bg0:full-model-running:v1')
+    expect(current).not.toBe('copied-run')
+    answer()
+    await check
+    expect(session.get('bg0:full-model-running:v1')).toBe(current)
+    settle()
+  })
 })
