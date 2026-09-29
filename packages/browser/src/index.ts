@@ -461,11 +461,13 @@ async function getPreferredEngine(
     const cached = await isModelCached(choice.definition)
     throwIfCancelled(signal)
     if (failedEngines.has(key)) continue
+    const attempt: EngineAttempt = {}
     try {
       return await getEngine(
         choice,
         (progress) => onDownload(progress, cached, choice.provider),
         signal,
+        attempt,
       )
     } catch (error) {
       throwIfCancelled(signal)
@@ -492,7 +494,7 @@ async function getPreferredEngine(
         // A damaged cached file fails every later load until it is replaced.
         // Retry once with a fresh download: for lite WASM there is no later
         // choice. A download that is corrupt again is not fetched a third time.
-        await evictCorruptLoad(choice.definition, error)
+        await evictCorruptLoad(choice.definition, attempt.load ?? error)
         throwIfCancelled(signal)
         if (reloaded.has(key)) {
           failedEngines.add(key)
@@ -622,10 +624,14 @@ function rememberWebgpuFailure(): void {
   }
 }
 
+/** Records which shared load a caller joined, so its failure can be named. */
+type EngineAttempt = { load?: EngineLoad }
+
 async function getEngine(
   choice: EngineChoice,
   onDownload: EngineProgressListener,
   signal?: AbortSignal,
+  attempt?: EngineAttempt,
 ): Promise<EngineLease> {
   const key = engineKey(choice)
   let load = engineLoads.get(key)
@@ -652,6 +658,7 @@ async function getEngine(
   // Reserve before awaiting initialization or notifying callers: a cache reset
   // must preserve pending acquisitions as well as active inference/refinement.
   const reservedLoad = load
+  if (attempt) attempt.load = reservedLoad
   reservedLoad.users++
   let released = false
   const release = async () => {

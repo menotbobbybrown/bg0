@@ -191,6 +191,24 @@ export async function clearIndexedDbCache(): Promise<void> {
   })
 }
 
+/** How long a write waits behind an eviction before it is dropped. */
+const EVICTION_WAIT_MS = 30_000
+
+async function settlesWithin(
+  promise: Promise<unknown>,
+  ms: number,
+): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<false>((resolve) => {
+    timer = setTimeout(() => resolve(false), ms)
+  })
+  try {
+    return await Promise.race([promise.then(() => true), timeout])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 /**
  * Make a cache safe to hand to transformers.js.
  *
@@ -209,11 +227,13 @@ export async function clearIndexedDbCache(): Promise<void> {
  * Eviction therefore reads the key as a miss until every write already in
  * flight has settled, then deletes it again, so a late write cannot restore
  * the evicted file. A write that starts during that wait is held until the
- * delete finishes, so the delete cannot remove it.
+ * delete finishes, so the delete cannot remove it. If the eviction does not
+ * finish within `evictionWaitMs`, that write is dropped instead.
  */
 export function createSafeCache(
   open: () => Promise<ModelCache | undefined>,
   expectedBytes: (url: string) => number | undefined = () => undefined,
+  evictionWaitMs = EVICTION_WAIT_MS,
 ): ModelCache & { delete(request: RequestInfo | URL): Promise<boolean> } {
   let opened: Promise<ModelCache | undefined> | undefined
   const cache = () => {
@@ -271,7 +291,11 @@ export function createSafeCache(
       const blocker = evicting.get(key)
       const write = (async () => {
         try {
-          if (blocker) await blocker
+          if (blocker && !(await settlesWithin(blocker, evictionWaitMs))) {
+            // An earlier write hangs. Drop this one rather than hold a
+            // model-sized response for as long as that write never finishes.
+            return
+          }
           await (await cache())?.put(input, response)
         } catch {
           // Caching is an optimization. The model is already in memory.
