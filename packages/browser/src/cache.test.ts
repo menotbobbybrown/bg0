@@ -144,6 +144,39 @@ describe('safe model cache', () => {
     expect(await cache.match(url)).toBeInstanceOf(Response)
   })
 
+  test('a slow delete hides the evicted model and holds new writes', async () => {
+    const entries = new Map<string, Response>([[url, sized(4)]])
+    let finishDelete: () => void = () => undefined
+    const inner: ModelCache = {
+      match: async (key) => entries.get(String(key)),
+      put: async (key, response) => {
+        entries.set(String(key), response)
+      },
+      delete: async (key) => {
+        await new Promise<void>((resolve) => {
+          finishDelete = resolve
+        })
+        return entries.delete(String(key))
+      },
+    }
+    const cache = createSafeCache(async () => inner)
+    const evicted = cache.delete(url)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    // A load that starts before the delete finishes must not read the old file.
+    expect(await cache.match(url)).toBeUndefined()
+    // Its fresh download lands after the delete, so the delete cannot remove it.
+    await cache.put(url, sized(4))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    finishDelete()
+    await evicted
+    for (let i = 0; i < 5; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+    expect(entries.has(url)).toBe(true)
+    expect(await cache.match(url)).toBeInstanceOf(Response)
+  })
+
   test('a write stuck behind a slow eviction is dropped', async () => {
     let finishFirst: () => void = () => undefined
     const put = mock(

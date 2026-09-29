@@ -223,12 +223,14 @@ async function settlesWithin(
  * from the expected size is removed instead of being handed to the runtime,
  * because a truncated model fails every later load until it is replaced.
  *
- * A model can be rejected and evicted before its own background write lands.
- * Eviction therefore reads the key as a miss until every write already in
- * flight has settled, then deletes it again, so a late write cannot restore
- * the evicted file. A write that starts during that wait is held until the
- * delete finishes, so the delete cannot remove it. If the eviction does not
- * finish within `evictionWaitMs`, that write is dropped instead.
+ * Eviction reads the key as a miss until its delete finishes, so a load that
+ * starts meanwhile cannot read the rejected file. A model can also be rejected
+ * before its own background write lands, so eviction also waits for every
+ * write already in flight to settle and then deletes again: a late write
+ * cannot restore the evicted file. A write that starts during an eviction is
+ * held until the eviction finishes, so its delete cannot remove it. If the
+ * eviction does not finish within `evictionWaitMs`, that write is dropped
+ * instead.
  */
 export function createSafeCache(
   open: () => Promise<ModelCache | undefined>,
@@ -251,15 +253,20 @@ export function createSafeCache(
   }
   const evict = (input: RequestInfo | URL) => {
     const key = keyOf(input)
+    const removed = remove(input)
     const pending = writes.get(key)
-    if (pending?.size) {
-      const settled = Promise.all(pending).then(() => remove(input))
-      evicting.set(key, settled)
-      void settled.finally(() => {
-        if (evicting.get(key) === settled) evicting.delete(key)
-      })
-    }
-    return remove(input)
+    const settled = Promise.all([
+      evicting.get(key),
+      removed,
+      pending?.size
+        ? Promise.all(pending).then(() => remove(input))
+        : undefined,
+    ])
+    evicting.set(key, settled)
+    void settled.finally(() => {
+      if (evicting.get(key) === settled) evicting.delete(key)
+    })
+    return removed
   }
 
   return {
