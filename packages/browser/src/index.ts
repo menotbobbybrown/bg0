@@ -135,15 +135,16 @@ type EngineLoad = {
   progress?: EngineProgress
   users: number
   retired: boolean
+  /** The cached copy of the model this load read, for eviction. */
+  copy: number
   disposal?: Promise<void>
 }
 
 const MODEL_CACHE_NAME = 'transformers-cache'
 const engineLoads = new Map<string, EngineLoad>()
 const failedEngines = new Set<string>()
-// A damaged cached model is evicted once per failed load, however many
-// callers shared it.
-const evictCorruptLoad = createFailureEvictions(evictCachedModel)
+// A damaged cached model is evicted once, however many loads read it.
+const corruptModels = createFailureEvictions(evictCachedModel, modelUrl)
 let detectedChoices: Promise<EngineChoice[]> | undefined
 let webgpuUsableForSession = true
 
@@ -494,7 +495,7 @@ async function getPreferredEngine(
         // A damaged cached file fails every later load until it is replaced.
         // Retry once with a fresh download: for lite WASM there is no later
         // choice. A download that is corrupt again is not fetched a third time.
-        await evictCorruptLoad(choice.definition, attempt.load ?? error)
+        await corruptModels.fail(choice.definition, attempt.load?.copy)
         throwIfCancelled(signal)
         if (reloaded.has(key)) {
           failedEngines.add(key)
@@ -638,6 +639,7 @@ async function getEngine(
   if (!load) {
     const listeners: EngineLoad['listeners'] = new Set()
     let currentLoad: EngineLoad
+    const copy = corruptModels.begin(choice.definition)
     const promise = loadEngine(choice, (progress) => {
       if (engineLoads.get(key) !== currentLoad) return
       currentLoad.progress = progress
@@ -645,7 +647,7 @@ async function getEngine(
         notifyEngineProgress(listener, progress)
       }
     })
-    currentLoad = { promise, listeners, users: 0, retired: false }
+    currentLoad = { promise, listeners, users: 0, retired: false, copy }
     load = currentLoad
     engineLoads.set(key, load)
     // A failed load must not be reused, even when every caller cancelled

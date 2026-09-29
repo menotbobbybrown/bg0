@@ -19,6 +19,7 @@ import * as image from './image'
 import {
   clearModelCache,
   prepareBackgroundRemoval,
+  type RemovalProgress,
   removeBackground,
 } from './index'
 import { FULL_MODEL, LITE_MODEL } from './models'
@@ -91,6 +92,42 @@ afterEach(async () => {
     else Reflect.deleteProperty(globalThis, key)
   }
 })
+
+/** Reports load progress, which later callers of the same load receive on joining. */
+function reportLoadProgress(
+  id: string,
+  options?: { progress_callback?: (event: never) => void },
+) {
+  options?.progress_callback?.({
+    status: 'progress',
+    name: id,
+    file: 'onnx/model_fp16.onnx',
+    progress: 40,
+    loaded: 40,
+    total: 100,
+  } as never)
+}
+
+/** Resolves `joined` once `count` callers have received progress from one model load. */
+function sharedLoad(count: number) {
+  let waiting = count
+  let resolve: () => void = () => undefined
+  const joined = new Promise<void>((done) => {
+    resolve = done
+  })
+  return {
+    joined,
+    caller() {
+      let seen = false
+      return (event: RemovalProgress) => {
+        if (seen || event.message !== 'Loading cached model…') return
+        seen = true
+        waiting -= 1
+        if (waiting === 0) resolve()
+      }
+    },
+  }
+}
 
 function model(output = 'output_image') {
   return Object.assign(
@@ -604,17 +641,22 @@ describe('model load recovery', () => {
     })
     let loads = 0
     const load = spyOn(AutoModel, 'from_pretrained').mockImplementation(
-      async () => {
+      async (id, options) => {
         loads += 1
         if (loads === 1) {
+          reportLoadProgress(id, options)
           await firstLoad
           throw corrupt
         }
         return model('logits') as never
       },
     )
-    const running = Promise.all([removeBackground(png), removeBackground(png)])
-    await new Promise((resolve) => setTimeout(resolve, 50))
+    const shared = sharedLoad(2)
+    const running = Promise.all([
+      removeBackground(png, { onProgress: shared.caller() }),
+      removeBackground(png, { onProgress: shared.caller() }),
+    ])
+    await shared.joined
     expect(load).toHaveBeenCalledTimes(1)
     failFirst()
     const results = await running
@@ -651,29 +693,36 @@ describe('model load recovery', () => {
       failFirst = resolve
     })
     let loads = 0
-    spyOn(AutoModel, 'from_pretrained').mockImplementation(async () => {
-      loads += 1
-      if (loads === 1) {
-        await firstLoad
-        throw corrupt
-      }
-      // The retry downloads a fresh file; its cache write lands later.
-      const cache = env.customCache as {
-        put: (key: string, response: Response) => Promise<void>
-      }
-      await cache.put(
-        modelFile(LITE_MODEL),
-        new Response('fresh', {
-          headers: { 'content-length': String(LITE_MODEL.bytes) },
-        }),
-      )
-      return model('logits') as never
-    })
+    spyOn(AutoModel, 'from_pretrained').mockImplementation(
+      async (id, options) => {
+        loads += 1
+        if (loads === 1) {
+          reportLoadProgress(id, options)
+          await firstLoad
+          throw corrupt
+        }
+        // The retry downloads a fresh file; its cache write lands later.
+        const cache = env.customCache as {
+          put: (key: string, response: Response) => Promise<void>
+        }
+        await cache.put(
+          modelFile(LITE_MODEL),
+          new Response('fresh', {
+            headers: { 'content-length': String(LITE_MODEL.bytes) },
+          }),
+        )
+        return model('logits') as never
+      },
+    )
+    const shared = sharedLoad(2)
     const running = Promise.all([
-      removeBackground(png),
-      removeBackground(png, { signal: new AbortController().signal }),
+      removeBackground(png, { onProgress: shared.caller() }),
+      removeBackground(png, {
+        onProgress: shared.caller(),
+        signal: new AbortController().signal,
+      }),
     ])
-    await new Promise((resolve) => setTimeout(resolve, 50))
+    await shared.joined
     failFirst()
     await running
     expect(writes).toBe(1)
@@ -961,16 +1010,14 @@ describe('model load recovery', () => {
 
   test('a load that fails after every caller cancelled is not reused', async () => {
     let failFirst: ((error: Error) => void) | undefined
-    const load = spyOn(AutoModel, 'from_pretrained').mockImplementation(
-      (() => {
-        if (!failFirst) {
-          return new Promise((_resolve, reject) => {
-            failFirst = reject
-          })
-        }
-        return Promise.resolve(model())
-      }) as never,
-    )
+    const load = spyOn(AutoModel, 'from_pretrained').mockImplementation((() => {
+      if (!failFirst) {
+        return new Promise((_resolve, reject) => {
+          failFirst = reject
+        })
+      }
+      return Promise.resolve(model())
+    }) as never)
     const controller = new AbortController()
     const pending = removeBackground(png, { signal: controller.signal })
     await new Promise((resolve) => setTimeout(resolve, 10))
