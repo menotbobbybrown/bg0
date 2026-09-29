@@ -111,7 +111,7 @@ export function redactSurveyText(value: string) {
       // Visitors may name the image they processed. Keep its filename and
       // dimensions in the browser like every other image detail.
       .replace(
-        /\S*\.(?:jpe?g|png|webp|gif|avif|heic|heif|bmp|tiff?|svg|dng|raw|psd)\b/gi,
+        /\S*\.(?:jpe?g|jpe|jfif|pjpe?g|pjp|png|apng|webp|gif|avif|heic|heics|heif|heifs|hif|bmp|tiff?|svg|dng|raw|psd)\b/gi,
         '[file]',
       )
       .replace(/\b\d{2,5}\s*[x×]\s*\d{2,5}\b/gi, '[size]')

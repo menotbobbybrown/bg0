@@ -283,6 +283,29 @@ describe('analytics privacy', () => {
     )
   })
 
+  test('redacts every image extension BG0 accepts, through the sanitizer', () => {
+    const names = [
+      'vacation.hif',
+      'scan.jfif',
+      'old.jpe',
+      'burst.heics',
+      'still.heifs',
+      'web.pjpeg',
+      'loop.apng',
+    ]
+    for (const name of names) {
+      const result = sanitizeResultSurvey(
+        surveyEvent({
+          $survey_id: SURVEY_ID,
+          [COMMENT_KEY]: `${name} lost its edges`,
+          $survey_response: `${name} lost its edges`,
+        }),
+      )
+      expect(result?.properties[COMMENT_KEY]).toBe('[file] lost its edges')
+      expect(result?.properties.$survey_response).toBe('[file] lost its edges')
+    }
+  })
+
   test('keeps a comment that follows a long run of whitespace', () => {
     expect(redactSurveyText(`${' '.repeat(5000)}edges were soft`)).toBe(
       'edges were soft',
