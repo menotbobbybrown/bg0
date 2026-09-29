@@ -514,7 +514,7 @@ async function getPreferredEngine(
 async function getPreferredChoices(): Promise<EngineChoice[]> {
   detectedChoices ??= detectEngineChoices()
   const choices = await detectedChoices
-  const skipFullModel = isFullModelBlocked()
+  const skipFullModel = await isFullModelBlocked()
   const usable = choices.filter(
     (choice) =>
       (choice.provider !== 'webgpu' || canTryWebgpu()) &&
@@ -965,10 +965,12 @@ async function loadEngine(
     () => undefined,
   )
 
+  let failure: Error | undefined
   try {
     return await Promise.race([pending, watch.failed])
   } catch (error) {
     abandoned = true
+    failure = error instanceof Error ? error : new Error('Model load failed.')
     if (
       error instanceof ModelStartTimeoutError ||
       error instanceof ModelDownloadError
@@ -978,9 +980,16 @@ async function loadEngine(
     // transformers.js may replace a failed request with its own error.
     throw watch.downloadFailure ?? error
   } finally {
-    watch.dispose()
+    watch.dispose(failure)
     watchedLoads.delete(watched)
-    settleFullModel?.()
+    if (abandoned) {
+      // An abandoned load can still be creating the session, which is where
+      // low-memory tabs die, so keep the marker until it really stops.
+      const settle = () => settleFullModel?.()
+      pending.then(settle, settle)
+    } else {
+      settleFullModel?.()
+    }
   }
 }
 

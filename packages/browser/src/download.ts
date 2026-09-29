@@ -86,7 +86,8 @@ export interface LoadWatch {
   /** Record progress from any source, such as a library progress event. */
   touch: () => void
   fetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
-  dispose: () => void
+  /** Stop watching. A reason also aborts requests still in flight. */
+  dispose: (reason?: Error) => void
 }
 
 type OpenRequest = {
@@ -363,7 +364,9 @@ export function createLoadWatch(
     },
     touch,
     fetch: watchedFetch,
-    dispose() {
+    dispose(reason?: Error) {
+      // A load that failed must not keep its other requests downloading.
+      if (reason && !controller.signal.aborted) controller.abort(reason)
       disposed = true
       stop()
     },
