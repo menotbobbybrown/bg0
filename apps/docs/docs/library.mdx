@@ -124,6 +124,8 @@ Use this to warn users on the WASM path that a large photo will take longer.
 On desktop/Android, the selected model (about 452 MiB for full BiRefNet or 94 MiB for lite) is fetched from the Hugging Face hub and kept in browser storage. Calls in the same page reuse the initialized model. After a reload, BG0 reuses the stored files but still initializes ONNX and uploads weights to WebGPU. Browsers may evict the files under storage pressure. `clearModelCache()` resets hardware selection and failure state and clears the IndexedDB fallback cache. It releases engines after any pending preparation or removal calls finish, including refinement. Files already in the browser Cache API may still be reused.
 
 On iOS, model/runtime files are build-emitted same-origin assets cached by HTTP.
-Repeated calls reuse the worker; a page reload still initializes a new runtime.
+Calls queued behind each other reuse the worker. When no call is waiting, the
+worker is released after inference to free its memory, so the next call starts
+a new runtime from the HTTP-cached files.
 `clearModelCache()` retires the iOS worker after active work finishes. Normal HTTP
 cache rules still apply; this does not guarantee eviction of downloaded assets.

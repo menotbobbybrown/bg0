@@ -51,6 +51,8 @@ export interface RemovalProgress {
   stage: 'preparing' | 'downloading' | 'processing' | 'finishing'
   progress: number
   message: string
+  /** Execution provider, once the engine for this run has been chosen. */
+  provider?: ExecutionProvider
 }
 
 export interface RemoveBackgroundOptions {
@@ -229,6 +231,7 @@ export async function removeBackground(
       stage: 'processing',
       progress: 0.7,
       message: 'Removing background…',
+      provider: engine.provider,
     })
     const { RawImage } = await import('@huggingface/transformers')
     const modelInput = new RawImage(
@@ -286,6 +289,7 @@ export async function removeBackground(
           stage: 'processing',
           progress: 0.89,
           message: 'Retrying background removal…',
+          provider: engine.provider,
         })
       }
     }

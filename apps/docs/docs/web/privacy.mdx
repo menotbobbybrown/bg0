@@ -22,10 +22,15 @@ Image bytes are read into browser memory, run through the model, and composited 
 
 bg0.dev uses PostHog to count page routes and a small set of product actions:
 choosing an image, whether local removal succeeded, the browser engine used,
-downloading or copying a result, and using result views. Full URLs, image
+downloading or copying a result, and using result views. If the page reloads
+during a removal, usually because the browser ran out of memory, the next visit
+reports only the step it reached and the browser engine. Full URLs, image
 metadata, session recordings, automatic click capture, and person profiles are
 disabled. A random anonymous identifier is kept in local storage so visits can
-be counted without an account.
+be counted without an account. While a removal runs, the tab keeps a small note
+in session storage with the step, the browser engine, the start time, and a
+random ID, so it can explain a reload. It is deleted when the removal ends or
+you leave the page.
 
 ## Verify it
 

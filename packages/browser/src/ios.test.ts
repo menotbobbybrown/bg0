@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test'
-import { IosWorker } from './ios'
+import { IosWorker, type IosWorkerTimeouts } from './ios'
 import { iosOutputSize, normalizeIosPixels } from './ios-pixels'
 
-function fakeWorker() {
+function fakeWorker(timeouts?: IosWorkerTimeouts) {
   const sent: { id: number; type: string }[] = []
   const worker = {
     onmessage: undefined as ((event: { data: object }) => void) | undefined,
@@ -19,7 +19,7 @@ function fakeWorker() {
   return {
     worker,
     sent,
-    engine: new IosWorker(() => worker as unknown as Worker),
+    engine: new IosWorker(() => worker as unknown as Worker, timeouts),
   }
 }
 
@@ -41,6 +41,13 @@ describe('iOS runtime lifetime', () => {
     const result = engine.load()
     worker.onerror?.()
     await expect(result).rejects.toMatchObject({ code: 'model-load-failed' })
+    expect(worker.terminated).toBe(true)
+  })
+  test('worker death during inference is an inference failure', async () => {
+    const { worker, engine } = fakeWorker()
+    const result = engine.run(new Uint8ClampedArray(512 * 512 * 4))
+    worker.onerror?.()
+    await expect(result).rejects.toMatchObject({ code: 'inference-failed' })
     expect(worker.terminated).toBe(true)
   })
   test('disposal cancels pending inference and frees the worker', async () => {
@@ -67,6 +74,76 @@ describe('iOS runtime lifetime', () => {
       message:
         'The local model could not be loaded. Check your connection and try again.',
     })
+    engine.dispose()
+  })
+  test('worker memory failures keep their cause for the user', async () => {
+    const { worker, sent, engine } = fakeWorker()
+    const result = engine.run(new Uint8ClampedArray(512 * 512 * 4))
+    worker.onmessage?.({ data: { id: sent[0].id, error: 'out-of-memory' } })
+    await expect(result).rejects.toMatchObject({
+      code: 'out-of-memory',
+      message: expect.stringContaining('ran out of memory'),
+    })
+    engine.dispose()
+  })
+  test('download progress reaches the stage callback', () => {
+    const { worker, engine } = fakeWorker()
+    const seen: [string, number | undefined][] = []
+    engine.onStage = (stage, progress) => seen.push([stage, progress])
+    void engine.load().catch(() => {})
+    worker.onmessage?.({ data: { stage: 'loading' } })
+    worker.onmessage?.({ data: { stage: 'loading', progress: 0.5 } })
+    expect(seen).toEqual([
+      ['loading', undefined],
+      ['loading', 0.5],
+    ])
+    engine.dispose()
+  })
+})
+
+describe('iOS worker watchdog', () => {
+  const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+  test('a silent model load becomes a retryable error', async () => {
+    const { worker, engine } = fakeWorker({ loadIdleMs: 20 })
+    const result = engine.load()
+    await expect(result).rejects.toMatchObject({
+      code: 'model-load-failed',
+      message: expect.stringContaining('stopped responding'),
+    })
+    expect(worker.terminated).toBe(true)
+    expect(engine.isDisposed).toBe(true)
+  })
+  test('load progress keeps a slow download alive', async () => {
+    const { worker, sent, engine } = fakeWorker({ loadIdleMs: 40 })
+    let settled = false
+    const result = engine.load().finally(() => {
+      settled = true
+    })
+    for (let i = 0; i < 4; i++) {
+      await wait(20)
+      worker.onmessage?.({ data: { stage: 'loading', progress: i / 4 } })
+    }
+    expect(settled).toBe(false)
+    worker.onmessage?.({ data: { id: sent[0].id, ready: true } })
+    await result
+    expect(worker.terminated).toBe(false)
+    engine.dispose()
+  })
+  test('an inference that never answers is stopped', async () => {
+    const { worker, engine } = fakeWorker({ runMs: 20 })
+    const result = engine.run(new Uint8ClampedArray(512 * 512 * 4))
+    await expect(result).rejects.toMatchObject({ code: 'inference-failed' })
+    expect(worker.terminated).toBe(true)
+  })
+  test('answered requests disarm the watchdog', async () => {
+    const { worker, sent, engine } = fakeWorker({ runMs: 20 })
+    const result = engine.run(new Uint8ClampedArray(512 * 512 * 4))
+    worker.onmessage?.({
+      data: { id: sent[0].id, alpha: new ArrayBuffer(512 * 512 * 4) },
+    })
+    await result
+    await wait(40)
+    expect(worker.terminated).toBe(false)
     engine.dispose()
   })
 })
@@ -102,6 +179,7 @@ const savedWorker = Object.getOwnPropertyDescriptor(globalThis, 'Worker')
 const png = new Blob(['png'], { type: 'image/png' })
 let constructed = 0
 let disposed = 0
+let closedBitmaps = 0
 beforeEach(() => {
   constructed = disposed = 0
   Object.defineProperty(globalThis, 'navigator', {
@@ -134,18 +212,24 @@ beforeEach(() => {
     },
   })
   spyOn(image, 'validateImage').mockResolvedValue('png')
-  spyOn(image, 'prepareImageForInference').mockResolvedValue({
+  closedBitmaps = 0
+  spyOn(image, 'prepareBoundedImage').mockImplementation(async () => ({
     data: new Uint8ClampedArray(512 * 512 * 4),
     width: 512,
     height: 512,
     sourceWidth: 768,
     sourceHeight: 512,
-  })
-  spyOn(image, 'decodeImage').mockResolvedValue({
-    width: 768,
-    height: 512,
-    close() {},
-  } as ImageBitmap)
+    bounded: {
+      width: 768,
+      height: 512,
+      close() {
+        closedBitmaps++
+      },
+    } as ImageBitmap,
+  }))
+  spyOn(image, 'decodeImage').mockRejectedValue(
+    new Error('The iOS path must decode the photo only once'),
+  )
   spyOn(image, 'imageToPng').mockResolvedValue(png)
   spyOn(image, 'maskToPng').mockResolvedValue(png)
 })
@@ -161,7 +245,7 @@ afterEach(() => {
   }
 })
 
-test('public iPhone flow reuses worker and never initializes Transformers', async () => {
+test('public iPhone flow reuses worker for queued photos and never initializes Transformers', async () => {
   const load = spyOn(AutoModel, 'from_pretrained')
   const [first, second] = await Promise.all([
     removeBackground(png),
@@ -176,6 +260,10 @@ test('public iPhone flow reuses worker and never initializes Transformers', asyn
   })
   expect(second.blob).toBe(png)
   expect(constructed).toBe(1)
+  // The worker is released once nothing else is queued.
+  expect(disposed).toBe(1)
+  expect(closedBitmaps).toBe(2)
+  expect(image.decodeImage).not.toHaveBeenCalled()
   expect(load).not.toHaveBeenCalled()
 })
 
@@ -194,18 +282,46 @@ test('abort at processing frees worker and a fresh request recovers', async () =
   expect(constructed).toBe(2)
 })
 
-test('cache clear during finishing preserves active work then retires worker', async () => {
+test('a lone photo releases the model heap before finishing', async () => {
+  const disposedAtFinish: number[] = []
   await removeBackground(png, {
     onProgress: ({ stage }) => {
       if (stage === 'finishing') {
+        disposedAtFinish.push(disposed)
+        clearModelCache()
+      }
+    },
+  })
+  expect(disposedAtFinish[0]).toBe(1)
+  expect(disposed).toBe(1)
+  await removeBackground(png)
+  expect(constructed).toBe(2)
+  expect(disposed).toBe(2)
+})
+
+test('cache clear during a queued batch preserves active work then retires worker', async () => {
+  let cleared = false
+  const first = removeBackground(png, {
+    onProgress: ({ stage }) => {
+      if (stage === 'finishing' && !cleared) {
+        cleared = true
         clearModelCache()
         expect(disposed).toBe(0)
       }
     },
   })
-  expect(disposed).toBe(1)
-  await removeBackground(png)
+  const second = removeBackground(png)
+  await Promise.all([first, second])
+  expect(disposed).toBe(2)
   expect(constructed).toBe(2)
+})
+
+test('failure after decoding still closes the bounded photo', async () => {
+  spyOn(image, 'maskToPng').mockRejectedValueOnce(new Error('encode failed'))
+  await expect(removeBackground(png)).rejects.toMatchObject({
+    code: 'inference-failed',
+  })
+  expect(closedBitmaps).toBe(1)
 })
 
 test('queued abort rejects before active inference finishes and does not start work', async () => {
@@ -240,8 +356,9 @@ test('queued abort rejects before active inference finishes and does not start w
         ),
       ]),
     ).toBe('cancelled')
-    expect(disposed).toBe(0)
-    expect(image.prepareImageForInference).toHaveBeenCalledTimes(1)
+    // Only the idle release of the first worker; the queued abort stops nothing.
+    expect(disposed).toBe(1)
+    expect(image.prepareBoundedImage).toHaveBeenCalledTimes(1)
   } finally {
     finish()
     await first
@@ -249,6 +366,26 @@ test('queued abort rejects before active inference finishes and does not start w
   }
   expect((await third).blob).toBe(png)
   expect(composite).toHaveBeenCalledTimes(2)
+})
+
+test('a cancelled queued photo still releases the kept worker', async () => {
+  const controller = new AbortController()
+  let disposedWhileFinishing: number | undefined
+  const first = removeBackground(png, {
+    onProgress: ({ stage }) => {
+      if (stage !== 'finishing' || disposedWhileFinishing !== undefined) return
+      // The first photo kept its worker because the second was waiting.
+      disposedWhileFinishing = disposed
+      controller.abort()
+    },
+  })
+  const second = removeBackground(png, { signal: controller.signal })
+  await expect(second).rejects.toMatchObject({ code: 'cancelled' })
+  await first
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  expect(disposedWhileFinishing).toBe(0)
+  expect(constructed).toBe(1)
+  expect(disposed).toBe(1)
 })
 
 test.each(['onerror', 'onmessageerror'] as const)(
@@ -337,3 +474,71 @@ test.each(['onerror', 'onmessageerror'] as const)(
     }
   },
 )
+
+test('a hung decode is abandoned on abort so a retry runs and the late bitmap is closed', async () => {
+  let late!: () => void
+  let lateClosed = false
+  spyOn(image, 'prepareBoundedImage').mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        late = () =>
+          resolve({
+            data: new Uint8ClampedArray(512 * 512 * 4),
+            width: 512,
+            height: 512,
+            sourceWidth: 768,
+            sourceHeight: 512,
+            bounded: {
+              width: 768,
+              height: 512,
+              close() {
+                lateClosed = true
+              },
+            } as ImageBitmap,
+          })
+      }),
+  )
+  const controller = new AbortController()
+  const hung = removeBackground(png, { signal: controller.signal })
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  expect(image.prepareBoundedImage).toHaveBeenCalledTimes(1)
+  controller.abort()
+  await expect(hung).rejects.toMatchObject({ code: 'cancelled' })
+  // The decode is still pending, yet the retry is not queued behind it.
+  expect((await removeBackground(png)).blob).toBe(png)
+  expect(constructed).toBe(1)
+  late()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  expect(lateClosed).toBe(true)
+  expect(image.maskToPng).toHaveBeenCalledTimes(1)
+})
+
+test('a hung PNG encode is abandoned on abort so a retry runs', async () => {
+  let encoding!: () => void
+  const began = new Promise<void>((resolve) => {
+    encoding = resolve
+  })
+  spyOn(image, 'maskToPng').mockImplementationOnce(() => {
+    encoding()
+    return new Promise<Blob>(() => {})
+  })
+  const controller = new AbortController()
+  const hung = removeBackground(png, { signal: controller.signal })
+  await began
+  controller.abort()
+  await expect(hung).rejects.toMatchObject({ code: 'cancelled' })
+  expect(closedBitmaps).toBe(1)
+  expect((await removeBackground(png)).blob).toBe(png)
+  expect(closedBitmaps).toBe(2)
+  // The first worker was released before encoding; the retry starts a fresh one.
+  expect(constructed).toBe(2)
+  expect(disposed).toBe(2)
+})
+
+test('iOS progress reports the WASM provider', async () => {
+  const providers = new Set<string | undefined>()
+  await removeBackground(png, {
+    onProgress: ({ provider }) => providers.add(provider),
+  })
+  expect([...providers]).toEqual(['wasm'])
+})

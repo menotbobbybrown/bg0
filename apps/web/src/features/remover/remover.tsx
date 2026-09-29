@@ -4,8 +4,8 @@ import {
   type BackgroundRemovalResult,
   IMAGE_ACCEPT_ATTRIBUTE,
   isIosBrowser,
-  type RemovalProgress,
   prepareBackgroundRemoval,
+  type RemovalProgress,
   removeBackground,
   SUPPORTED_IMAGE_FORMAT_LABEL,
   SUPPORTED_IMAGE_MIME_TYPES,
@@ -33,12 +33,22 @@ import {
   captureFeatureUsed,
   captureImageSelected,
   captureRemovalFailed,
+  captureRemovalInterrupted,
   captureRemovalSucceeded,
   captureResultDownloaded,
   showResultSurvey,
 } from '#/lib/analytics'
 import { cn } from '#/lib/utils'
 import { CompareSlider, type CompareView } from './compare-slider'
+import {
+  createStallGuard,
+  INTERRUPTED_RUN_MESSAGE,
+  RUN_STALL_MS,
+  type RunMarkerHandle,
+  STALLED_RUN_MESSAGE,
+  startRunMarker,
+  takeInterruptedRun,
+} from './interrupted-run'
 
 type State =
   | { status: 'idle' }
@@ -53,6 +63,11 @@ type State =
   | { status: 'error'; message: string; code: BackgroundRemovalErrorCode }
 
 const CLIPBOARD_TIMEOUT_MS = 1500
+// Without HEIC in accept, the iOS photo picker hands over a JPEG, which avoids
+// the slower, memory-heavy HEIC fallback decoder on older Safari versions.
+const IOS_PHOTO_ACCEPT_ATTRIBUTE = SUPPORTED_IMAGE_MIME_TYPES.filter(
+  (type) => !/hei[cf]/.test(type),
+).join(',')
 type InputMethod = 'drop' | 'paste' | 'picker'
 type RemoveBackground = typeof removeBackground
 type WaitForPaint = () => Promise<void>
@@ -60,6 +75,7 @@ type WaitForPaint = () => Promise<void>
 interface RemoverProps {
   removeBackgroundImpl?: RemoveBackground
   waitForPaintImpl?: WaitForPaint
+  stallTimeoutMs?: number
 }
 
 export function warmBackgroundRemovalModel(
@@ -176,6 +192,7 @@ function clipboardImagesSupported() {
 export function Remover({
   removeBackgroundImpl = removeBackground,
   waitForPaintImpl = waitForNextPaint,
+  stallTimeoutMs = RUN_STALL_MS,
 }: RemoverProps = {}) {
   const fileInputRef = useRef<HTMLInputElement>(null)
   const photoInputRef = useRef<HTMLInputElement>(null)
@@ -188,11 +205,16 @@ export function Remover({
   const [view, setView] = useState<CompareView>('compare')
   const [peeking, setPeeking] = useState(false)
   const [isDragging, setIsDragging] = useState(false)
-  const [copied, setCopied] = useState(false)
+  // The result URL the Copy button last succeeded for, so a newer result
+  // never inherits the previous one's "Copied" label.
+  const [copiedUrl, setCopiedUrl] = useState<string>()
+  const copied = state.status === 'result' && copiedUrl === state.resultUrl
   const [toast, setToast] = useState<ToastMessage | null>(null)
   const [announcement, setAnnouncement] = useState('')
   const [showIosExportNotice, setShowIosExportNotice] = useState(false)
   const [mobile, setMobile] = useState(false)
+  const [interrupted, setInterrupted] = useState(false)
+  const runMarker = useRef<RunMarkerHandle | null>(null)
   const [failedPreviewUrl, setFailedPreviewUrl] = useState<string>()
   const pickerRef = useRef<HTMLDivElement>(null)
   const [pickerOffscreen, setPickerOffscreen] = useState(false)
@@ -213,6 +235,23 @@ export function Remover({
   }, [])
 
   useEffect(() => {
+    // The check waits on a Web Lock query. The event is reported even if the
+    // remover unmounts first, but the notice is shown only on a mounted, idle
+    // remover so it never covers a run the user has already started.
+    void takeInterruptedRun().then((previous) => {
+      if (!previous) return
+      captureRemovalInterrupted(previous.stage, previous.provider)
+      if (!mounted.current || latestState.current.status !== 'idle') return
+      setInterrupted(true)
+      setAnnouncement(INTERRUPTED_RUN_MESSAGE)
+    })
+    // Leaving or reloading the page on purpose is not an interruption.
+    const leave = () => runMarker.current?.clear()
+    window.addEventListener('pagehide', leave)
+    return () => window.removeEventListener('pagehide', leave)
+  }, [])
+
+  useEffect(() => {
     latestState.current = state
   }, [state])
 
@@ -221,6 +260,7 @@ export function Remover({
     return () => {
       mounted.current = false
       abortController.current?.abort()
+      runMarker.current?.clear()
       cleanupUrls(latestState.current)
     }
   }, [])
@@ -255,6 +295,7 @@ export function Remover({
       const controller = new AbortController()
       abortController.current = controller
       setView('compare')
+      setInterrupted(false)
       if (replacingUnsaved) notify('Previous result replaced before download')
       setAnnouncement(
         replacing
@@ -266,6 +307,22 @@ export function Remover({
         sourceUrl,
         progress: { stage: 'preparing', progress: 0, message: 'Preparing…' },
       })
+      const marker = startRunMarker()
+      runMarker.current = marker
+      // A run that stops reporting progress would otherwise spin forever.
+      const stall = createStallGuard(() => {
+        if (abortController.current !== controller || !mounted.current) return
+        marker.clear()
+        cleanupUrls(latestState.current)
+        commitState({
+          status: 'error',
+          message: STALLED_RUN_MESSAGE,
+          code: 'inference-failed',
+        })
+        setAnnouncement(STALLED_RUN_MESSAGE)
+        captureRemovalFailed(inputMethod, 'inference-failed')
+        controller.abort()
+      }, stallTimeoutMs)
 
       try {
         // Give the browser a frame to paint the source before inference can
@@ -290,6 +347,8 @@ export function Remover({
             ) {
               return
             }
+            stall.touch()
+            marker.update(progress.stage, progress.provider)
             setState((current) => {
               if (current.status !== 'processing') return current
               const next = { ...current, progress }
@@ -366,6 +425,10 @@ export function Remover({
             reason: code,
           })
         }
+      } finally {
+        stall.stop()
+        marker.clear()
+        if (runMarker.current === marker) runMarker.current = null
       }
     },
     [
@@ -373,6 +436,7 @@ export function Remover({
       notify,
       removeBackgroundImpl,
       setResultSaved,
+      stallTimeoutMs,
       waitForPaintImpl,
     ],
   )
@@ -390,6 +454,7 @@ export function Remover({
 
   const reset = useCallback(() => {
     abortController.current?.abort()
+    runMarker.current?.clear()
     cleanupUrls(latestState.current)
     lastFile.current = null
     if (fileInputRef.current) fileInputRef.current.value = ''
@@ -438,9 +503,15 @@ export function Remover({
       const shown = latestState.current
       // Announcing it then would also replace the new image's status.
       if (shown.status === 'result' && shown.resultUrl === current.resultUrl) {
-        setCopied(true)
+        setCopiedUrl(current.resultUrl)
         setResultSaved(true)
-        window.setTimeout(() => setCopied(false), 1600)
+        window.setTimeout(
+          () =>
+            setCopiedUrl((url) =>
+              url === current.resultUrl ? undefined : url,
+            ),
+          1600,
+        )
         notify('PNG copied to the clipboard')
       }
       captureFeatureUsed('copy_result')
@@ -710,6 +781,18 @@ export function Remover({
                 {SUPPORTED_IMAGE_FORMAT_LABEL} · free, no account
               </p>
             </div>
+            {interrupted && (
+              <p
+                role="status"
+                className="relative z-10 flex max-w-[420px] items-start justify-center gap-1.5 text-center text-sm text-foreground"
+              >
+                <TriangleAlert
+                  aria-hidden="true"
+                  className="mt-0.5 size-4 shrink-0 text-destructive"
+                />
+                <span>{INTERRUPTED_RUN_MESSAGE}</span>
+              </p>
+            )}
             {showIosExportNotice && (
               <p className="relative z-10 flex max-w-[460px] items-start justify-center gap-1.5 text-center text-[11px] leading-4 text-muted-foreground">
                 <TriangleAlert
@@ -928,7 +1011,7 @@ export function Remover({
       <input
         ref={photoInputRef}
         type="file"
-        accept={IMAGE_ACCEPT_ATTRIBUTE}
+        accept={mobile ? IOS_PHOTO_ACCEPT_ATTRIBUTE : IMAGE_ACCEPT_ATTRIBUTE}
         className="sr-only"
         onChange={(event) => {
           selectFiles(event.target.files, 'picker')
