@@ -757,6 +757,49 @@ describe('Remover result screen', () => {
     }
   })
 
+  test('a new result does not inherit the previous result copy label', async () => {
+    const { urls, remove, requests, view } = await renderWithResult()
+    const secure = Object.getOwnPropertyDescriptor(window, 'isSecureContext')
+    const clipboard = Object.getOwnPropertyDescriptor(navigator, 'clipboard')
+    const originalClipboardItem = globalThis.ClipboardItem
+    Object.defineProperty(window, 'isSecureContext', {
+      configurable: true,
+      value: true,
+    })
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { write: async () => undefined },
+    })
+    globalThis.ClipboardItem = class {
+      constructor(readonly items: Record<string, Blob>) {}
+    } as unknown as typeof ClipboardItem
+    try {
+      fireEvent.click(view.getByRole('button', { name: /^Copy/ }))
+      await waitFor(() => {
+        expect(
+          view.getByRole('button', { name: /^Copied/ }).textContent,
+        ).toContain('Copied')
+      })
+      selectFile(view, new File(['two'], 'two.png', { type: 'image/png' }))
+      await waitFor(() => expect(remove).toHaveBeenCalledTimes(2))
+      await act(async () => requests[1]?.resolve(resultWithSource()))
+      await waitFor(() => {
+        expect(view.getByRole('button', { name: /Download PNG/ })).toBeTruthy()
+      })
+      expect(
+        view.getByRole('button', { name: /^Copy/ }).textContent,
+      ).not.toContain('Copied')
+    } finally {
+      if (secure) Object.defineProperty(window, 'isSecureContext', secure)
+      else delete (window as { isSecureContext?: boolean }).isSecureContext
+      if (clipboard) Object.defineProperty(navigator, 'clipboard', clipboard)
+      else delete (navigator as { clipboard?: Clipboard }).clipboard
+      globalThis.ClipboardItem = originalClipboardItem
+      view.unmount()
+      urls.restore()
+    }
+  })
+
   test('a copy that finishes after a replacement leaves the new result unsaved', async () => {
     const { urls, remove, requests, view } = await renderWithResult()
     const write = deferred<void>()

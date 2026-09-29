@@ -188,7 +188,10 @@ export function Remover({
   const [view, setView] = useState<CompareView>('compare')
   const [peeking, setPeeking] = useState(false)
   const [isDragging, setIsDragging] = useState(false)
-  const [copied, setCopied] = useState(false)
+  // The result URL the Copy button last succeeded for, so a newer result
+  // never inherits the previous one's "Copied" label.
+  const [copiedUrl, setCopiedUrl] = useState<string>()
+  const copied = state.status === 'result' && copiedUrl === state.resultUrl
   const [toast, setToast] = useState<ToastMessage | null>(null)
   const [announcement, setAnnouncement] = useState('')
   const [showIosExportNotice, setShowIosExportNotice] = useState(false)
@@ -438,9 +441,15 @@ export function Remover({
       const shown = latestState.current
       // Announcing it then would also replace the new image's status.
       if (shown.status === 'result' && shown.resultUrl === current.resultUrl) {
-        setCopied(true)
+        setCopiedUrl(current.resultUrl)
         setResultSaved(true)
-        window.setTimeout(() => setCopied(false), 1600)
+        window.setTimeout(
+          () =>
+            setCopiedUrl((url) =>
+              url === current.resultUrl ? undefined : url,
+            ),
+          1600,
+        )
         notify('PNG copied to the clipboard')
       }
       captureFeatureUsed('copy_result')
