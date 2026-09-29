@@ -973,7 +973,9 @@ export function Remover({
             </span>
             <div>
               <h2 className="text-base font-semibold">
-                That image could not be processed
+                {state.code === 'image-too-large'
+                  ? 'This image is too large'
+                  : 'That image could not be processed'}
               </h2>
               <p className="mt-1.5 max-w-sm text-[13px] leading-5 text-muted-foreground">
                 {state.message}

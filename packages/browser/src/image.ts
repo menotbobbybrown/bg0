@@ -1,6 +1,14 @@
 import { BackgroundRemovalError } from './errors'
 
-export const MAX_IMAGE_BYTES = 40 * 1024 * 1024
+// Decimal megabytes, the unit iOS, Android, and macOS use when they show a
+// file size, so the limit and error message match what people see.
+export const MAX_IMAGE_BYTES = 60_000_000
+// One decimal, like a file manager, but never shown as 60 MB or less for a
+// file that is over the limit.
+function formatRejectedSize(bytes: number) {
+  const tenths = Math.max(Math.round(bytes / 100_000), 601)
+  return (tenths / 10).toFixed(1)
+}
 export const SUPPORTED_IMAGE_MIME_TYPES = [
   'image/png',
   'image/jpeg',
@@ -64,7 +72,7 @@ export async function validateImage(
   if (input.size > MAX_IMAGE_BYTES) {
     throw new BackgroundRemovalError(
       'image-too-large',
-      'This image is over 40 MB. Choose a smaller file.',
+      `This file is ${formatRejectedSize(input.size)} MB, and BG0 takes images up to 60 MB. Save it as a JPG or at a smaller size, then try again.`,
     )
   }
 
