@@ -224,7 +224,8 @@ async function settlesWithin(
  * because a truncated model fails every later load until it is replaced.
  *
  * Eviction reads the key as a miss until its delete finishes, so a load that
- * starts meanwhile cannot read the rejected file. A model can also be rejected
+ * starts meanwhile cannot read the rejected file. A read that was already in
+ * flight when the eviction began also returns a miss. A model can also be rejected
  * before its own background write lands, so eviction also waits for every
  * write already in flight to settle and then deletes again: a late write
  * cannot restore the evicted file. A write that starts during an eviction is
@@ -244,6 +245,7 @@ export function createSafeCache(
   }
   const writes = new Map<string, Set<Promise<void>>>()
   const evicting = new Map<string, Promise<unknown>>()
+  const evictions = new Map<string, number>()
   const remove = async (input: RequestInfo | URL) => {
     try {
       return Boolean(await (await cache())?.delete?.(input))
@@ -253,6 +255,7 @@ export function createSafeCache(
   }
   const evict = (input: RequestInfo | URL) => {
     const key = keyOf(input)
+    evictions.set(key, (evictions.get(key) ?? 0) + 1)
     const removed = remove(input)
     const pending = writes.get(key)
     const settled = Promise.all([
@@ -271,15 +274,18 @@ export function createSafeCache(
 
   return {
     async match(input) {
-      if (evicting.has(keyOf(input))) return undefined
+      const key = keyOf(input)
+      if (evicting.has(key)) return undefined
+      const generation = evictions.get(key)
       let response: Response | undefined
       try {
         response = (await (await cache())?.match(input)) ?? undefined
       } catch {
         return undefined
       }
-      if (!response) return undefined
-      const expected = expectedBytes(keyOf(input))
+      // An eviction that started during the read may have deleted this file.
+      if (!response || evictions.get(key) !== generation) return undefined
+      const expected = expectedBytes(key)
       const length = response.headers.get('content-length')
       if (
         expected !== undefined &&

@@ -177,6 +177,33 @@ describe('safe model cache', () => {
     expect(await cache.match(url)).toBeInstanceOf(Response)
   })
 
+  test('a read in flight when an eviction starts returns a miss', async () => {
+    const entries = new Map<string, Response>([[url, sized(4)]])
+    let finishRead: () => void = () => undefined
+    const inner: ModelCache = {
+      match: async (key) => {
+        const response = entries.get(String(key))
+        await new Promise<void>((resolve) => {
+          finishRead = resolve
+        })
+        return response
+      },
+      put: async (key, response) => {
+        entries.set(String(key), response)
+      },
+      delete: async (key) => entries.delete(String(key)),
+    }
+    const cache = createSafeCache(async () => inner)
+    const read = cache.match(url)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    await cache.delete(url)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    // The read found the evicted file before the delete, so it must not use it.
+    finishRead()
+    expect(await read).toBeUndefined()
+  })
+
   test('a write stuck behind a slow eviction is dropped', async () => {
     let finishFirst: () => void = () => undefined
     const put = mock(
