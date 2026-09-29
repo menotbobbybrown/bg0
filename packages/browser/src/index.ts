@@ -3,6 +3,7 @@ import {
   createIndexedDbCache,
   createSafeCache,
   isIndexedDbAvailable,
+  lastReaderOf,
   type ModelCache,
   type SafeModelCache,
 } from './cache'
@@ -658,9 +659,13 @@ async function getEngine(
         }
       },
       () => {
-        currentLoad.copy ??= getModelCache()?.copyLastRead(
-          modelUrl(choice.definition),
-        )
+        // Copy numbers are unique across cache instances, so a copy read
+        // through a cache that has since been replaced never matches, and the
+        // load evicts nothing.
+        const url = modelUrl(choice.definition)
+        currentLoad.copy ??= (
+          lastReaderOf(url) ?? getModelCache()
+        )?.copyLastRead(url)
       },
     )
     currentLoad = { promise, listeners, users: 0, retired: false }
