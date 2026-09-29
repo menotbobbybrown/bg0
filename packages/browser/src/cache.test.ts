@@ -1,5 +1,5 @@
 import { describe, expect, mock, test } from 'bun:test'
-import { createSafeCache, type ModelCache } from './cache'
+import { createSafeCache, lastReaderOf, type ModelCache } from './cache'
 import { createFailureEvictions } from './eviction'
 
 const url = 'https://huggingface.co/a/resolve/r/onnx/model_fp16.onnx'
@@ -338,5 +338,18 @@ describe('safe model cache', () => {
     // A load that read through the old cache fails late.
     await failures.fail(url, copy)
     expect(entries.has(url)).toBe(true)
+  })
+
+  test('reports which cache instance served the latest read', async () => {
+    const open = async () => ({
+      match: async () => sized(4),
+      put: async () => undefined,
+    })
+    const old = createSafeCache(open)
+    const current = createSafeCache(open)
+    await old.match(url)
+    expect(lastReaderOf(url)).toBe(old)
+    await current.match(url)
+    expect(lastReaderOf(url)).toBe(current)
   })
 })

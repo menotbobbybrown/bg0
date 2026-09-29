@@ -231,6 +231,21 @@ const nextCopy = () => {
   copyCount += 1
   return copyCount
 }
+// The cache instance that served the latest `match` of each key.
+const readers = new Map<string, SafeModelCache>()
+
+/**
+ * The cache that served the latest `match` of the key, whichever instance
+ * transformers.js had installed at the time. Ask it, not the current cache,
+ * which copy a load read: a reset may replace the cache between the read and
+ * the load's `download` event, and a load may read through a cache installed
+ * after it started.
+ */
+export function lastReaderOf(
+  request: RequestInfo | URL,
+): SafeModelCache | undefined {
+  return readers.get(keyOf(request))
+}
 
 /**
  * Make a cache safe to hand to transformers.js.
@@ -331,12 +346,13 @@ export function createSafeCache(
     return { response, copy }
   }
 
-  return {
+  const safe: SafeModelCache = {
     async match(input) {
       const key = keyOf(input)
       const hit = await read(input)
       if (hit) hits.set(key, hit.copy)
       else hits.delete(key)
+      readers.set(key, safe)
       return hit?.response
     },
     async has(input) {
@@ -378,4 +394,5 @@ export function createSafeCache(
     },
     delete: evict,
   }
+  return safe
 }

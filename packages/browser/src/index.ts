@@ -3,6 +3,7 @@ import {
   createIndexedDbCache,
   createSafeCache,
   isIndexedDbAvailable,
+  lastReaderOf,
   type ModelCache,
   type SafeModelCache,
 } from './cache'
@@ -657,11 +658,14 @@ async function getEngine(
           notifyEngineProgress(listener, progress)
         }
       },
-      (cache) => {
-        // A load that read through a replaced cache cannot tell which copy of
-        // the current cache it read, so it records none and never evicts.
-        if (cache !== getModelCache()) return
-        currentLoad.copy ??= cache?.copyLastRead(modelUrl(choice.definition))
+      () => {
+        // Copy numbers are unique across cache instances, so a copy read
+        // through a cache that has since been replaced never matches, and the
+        // load evicts nothing.
+        const url = modelUrl(choice.definition)
+        currentLoad.copy ??= (
+          lastReaderOf(url) ?? getModelCache()
+        )?.copyLastRead(url)
       },
     )
     currentLoad = { promise, listeners, users: 0, retired: false }
@@ -953,26 +957,24 @@ function baseFetch(input: RequestInfo | URL, init?: RequestInit) {
   return networkFetch(input, init)
 }
 
-function configureModelCache(env: TransformersEnv): SafeModelCache | undefined {
+function configureModelCache(env: TransformersEnv): void {
   const cache = getModelCache()
   env.useBrowserCache = false
   env.useCustomCache = Boolean(cache)
   env.customCache = cache ?? null
-  return cache
 }
 
 async function loadEngine(
   choice: EngineChoice,
   onDownload: EngineProgressListener,
-  // Receives the cache this load installed for its reads.
-  onModelFileOpened: (cache: SafeModelCache | undefined) => void,
+  onModelFileOpened: () => void,
 ): Promise<Engine> {
   const { provider, definition } = choice
   const { AutoModel, AutoProcessor, env } = await import(
     '@huggingface/transformers'
   )
   const transformersEnv = env as unknown as TransformersEnv
-  const cache = configureModelCache(transformersEnv)
+  configureModelCache(transformersEnv)
   const watch = createLoadWatch(superviseFetch(transformersEnv), {
     ...modelLoadTimings,
     expectedBytes: (url) =>
@@ -997,7 +999,7 @@ async function loadEngine(
     watch.touch()
     // Transformers.js reports `download` once it has chosen between the cache
     // and the network, before any other load can read the file.
-    if (isModelFileOpened(event, definition)) onModelFileOpened(cache)
+    if (isModelFileOpened(event, definition)) onModelFileOpened()
     progressCallback(event)
   }
 
