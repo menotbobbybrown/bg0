@@ -89,16 +89,25 @@ export function isIndexedDbAvailable(): boolean {
   return typeof indexedDB !== 'undefined'
 }
 
+// Counts resets. A cache created before a reset belongs to the deleted
+// database.
+let resets = 0
+
 export function createIndexedDbCache(): ModelCache {
+  const createdAt = resets
   let database: Promise<IDBDatabase> | undefined
+  let deleted = false
+  // A load that started before a reset may still read or write through this
+  // cache. Reopening would recreate the deleted database and write the model
+  // back, so once its database is deleted this cache stays empty. A version
+  // change from another tab's reset closes it the same way.
   const db = () => {
-    if (!database) {
-      const opened = openDatabase(() => {
-        // The next use opens a new connection.
-        if (database === opened) database = undefined
-      })
-      database = opened
+    if (deleted || createdAt !== resets) {
+      return Promise.reject(new Error('The model cache was reset'))
     }
+    database ??= openDatabase(() => {
+      deleted = true
+    })
     return database
   }
   const pendingWrites = new Set<string>()
@@ -197,6 +206,7 @@ export function createIndexedDbCache(): ModelCache {
 }
 
 export async function clearIndexedDbCache(): Promise<void> {
+  resets += 1
   if (!isIndexedDbAvailable()) return
   await new Promise<void>((resolve) => {
     const req = indexedDB.deleteDatabase(DB_NAME)

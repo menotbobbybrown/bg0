@@ -37,6 +37,7 @@
   "devDependencies": {
     "@biomejs/biome": "^2.4.5",
     "@types/bun": "^1.4.2",
+    "fake-indexeddb": "^6.2.5",
     "heic-to": "1.5.2",
     "typescript": "^6.0.2"
   },
