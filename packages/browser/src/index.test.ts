@@ -808,6 +808,84 @@ describe('model load recovery', () => {
     expect(await entries.get(modelFile(LITE_MODEL))?.text()).toBe('fresh')
   })
 
+  test('a reset between a load read and its file-open event keeps the new model', async () => {
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: { userAgent: 'Firefox/150.0' },
+    })
+    const entries = installCaches(() => undefined)
+    entries.set(
+      modelFile(LITE_MODEL),
+      new Response('x', {
+        headers: { 'content-length': String(LITE_MODEL.bytes) },
+      }),
+    )
+    let resumeFirst: () => void = () => undefined
+    const firstResumed = new Promise<void>((resolve) => {
+      resumeFirst = resolve
+    })
+    let failFirst: () => void = () => undefined
+    const firstFails = new Promise<void>((resolve) => {
+      failFirst = resolve
+    })
+    let read: () => void = () => undefined
+    const fileRead = new Promise<void>((resolve) => {
+      read = resolve
+    })
+    let opened: () => void = () => undefined
+    const fileOpened = new Promise<void>((resolve) => {
+      opened = resolve
+    })
+    let loads = 0
+    spyOn(AutoModel, 'from_pretrained').mockImplementation(
+      async (id, options) => {
+        loads += 1
+        const cache = env.customCache as {
+          match: (key: string) => Promise<Response | undefined>
+          put: (key: string, response: Response) => Promise<void>
+        }
+        if (loads === 1) {
+          // The first load reads the damaged copy through the old cache and
+          // reports opening it only after the reset.
+          await cache.match(modelFile(LITE_MODEL))
+          read()
+          await firstResumed
+          openModelFile(id, options)
+          opened()
+          await firstFails
+          throw new Error(
+            "Can't create a session. ERROR_CODE: 7, ERROR_MESSAGE: Failed to load model because protobuf parsing failed.",
+          )
+        }
+        await cache.put(
+          modelFile(LITE_MODEL),
+          new Response('fresh', {
+            headers: { 'content-length': String(LITE_MODEL.bytes) },
+          }),
+        )
+        openModelFile(id, options)
+        return model('logits') as never
+      },
+    )
+    const controller = new AbortController()
+    const pending = removeBackground(png, { signal: controller.signal })
+    await fileRead
+    controller.abort()
+    await expect(pending).rejects.toMatchObject({ code: 'cancelled' })
+    clearModelCache()
+    resumeFirst()
+    await fileOpened
+    expect(await removeBackground(png)).toMatchObject({
+      model: 'birefnet-lite',
+    })
+    // The first load read a copy of the replaced cache, so it evicts nothing.
+    failFirst()
+    for (let i = 0; i < 5; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+    expect(await entries.get(modelFile(LITE_MODEL))?.text()).toBe('fresh')
+  })
+
   test('a load records the copy it opened, not the copy when it started', async () => {
     Object.defineProperty(globalThis, 'navigator', {
       configurable: true,

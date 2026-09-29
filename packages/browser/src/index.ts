@@ -657,10 +657,11 @@ async function getEngine(
           notifyEngineProgress(listener, progress)
         }
       },
-      () => {
-        currentLoad.copy ??= getModelCache()?.copyLastRead(
-          modelUrl(choice.definition),
-        )
+      (cache) => {
+        // A load that read through a replaced cache cannot tell which copy of
+        // the current cache it read, so it records none and never evicts.
+        if (cache !== getModelCache()) return
+        currentLoad.copy ??= cache?.copyLastRead(modelUrl(choice.definition))
       },
     )
     currentLoad = { promise, listeners, users: 0, retired: false }
@@ -952,24 +953,26 @@ function baseFetch(input: RequestInfo | URL, init?: RequestInit) {
   return networkFetch(input, init)
 }
 
-function configureModelCache(env: TransformersEnv): void {
+function configureModelCache(env: TransformersEnv): SafeModelCache | undefined {
   const cache = getModelCache()
   env.useBrowserCache = false
   env.useCustomCache = Boolean(cache)
   env.customCache = cache ?? null
+  return cache
 }
 
 async function loadEngine(
   choice: EngineChoice,
   onDownload: EngineProgressListener,
-  onModelFileOpened: () => void,
+  // Receives the cache this load installed for its reads.
+  onModelFileOpened: (cache: SafeModelCache | undefined) => void,
 ): Promise<Engine> {
   const { provider, definition } = choice
   const { AutoModel, AutoProcessor, env } = await import(
     '@huggingface/transformers'
   )
   const transformersEnv = env as unknown as TransformersEnv
-  configureModelCache(transformersEnv)
+  const cache = configureModelCache(transformersEnv)
   const watch = createLoadWatch(superviseFetch(transformersEnv), {
     ...modelLoadTimings,
     expectedBytes: (url) =>
@@ -994,7 +997,7 @@ async function loadEngine(
     watch.touch()
     // Transformers.js reports `download` once it has chosen between the cache
     // and the network, before any other load can read the file.
-    if (isModelFileOpened(event, definition)) onModelFileOpened()
+    if (isModelFileOpened(event, definition)) onModelFileOpened(cache)
     progressCallback(event)
   }
 
