@@ -1,5 +1,10 @@
 import { describe, expect, mock, test } from 'bun:test'
-import { createSafeCache, lastReaderOf, type ModelCache } from './cache'
+import {
+  createIndexedDbCache,
+  createSafeCache,
+  lastReaderOf,
+  type ModelCache,
+} from './cache'
 import { createFailureEvictions } from './eviction'
 
 const url = 'https://huggingface.co/a/resolve/r/onnx/model_fp16.onnx'
@@ -351,5 +356,60 @@ describe('safe model cache', () => {
     expect(lastReaderOf(url)).toBe(old)
     await current.match(url)
     expect(lastReaderOf(url)).toBe(current)
+  })
+})
+
+describe('IndexedDB model cache', () => {
+  test('closes its connection when a reset deletes the database', async () => {
+    const connections: {
+      close: ReturnType<typeof mock>
+      onversionchange: (() => void) | null
+    }[] = []
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'indexedDB')
+    Object.defineProperty(globalThis, 'indexedDB', {
+      configurable: true,
+      value: {
+        open: () => {
+          const connection = {
+            close: mock(() => undefined),
+            onversionchange: null as (() => void) | null,
+            objectStoreNames: { contains: () => true },
+            transaction: () => ({
+              objectStore: () => ({
+                get: () => {
+                  // Every key reads as missing.
+                  const read = {
+                    result: undefined,
+                    onsuccess: null as (() => void) | null,
+                  }
+                  setTimeout(() => read.onsuccess?.(), 0)
+                  return read
+                },
+              }),
+            }),
+          }
+          connections.push(connection)
+          const open = {
+            result: connection,
+            onsuccess: null as (() => void) | null,
+          }
+          setTimeout(() => open.onsuccess?.(), 0)
+          return open
+        },
+      },
+    })
+    try {
+      const cache = createIndexedDbCache()
+      expect(await cache.match(url)).toBeUndefined()
+      expect(connections).toHaveLength(1)
+      connections[0]?.onversionchange?.()
+      expect(connections[0]?.close).toHaveBeenCalledTimes(1)
+      // The next read opens a new connection.
+      expect(await cache.match(url)).toBeUndefined()
+      expect(connections).toHaveLength(2)
+    } finally {
+      if (descriptor) Object.defineProperty(globalThis, 'indexedDB', descriptor)
+      else Reflect.deleteProperty(globalThis, 'indexedDB')
+    }
   })
 })
