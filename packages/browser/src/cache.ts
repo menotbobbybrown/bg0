@@ -191,6 +191,23 @@ export async function clearIndexedDbCache(): Promise<void> {
   })
 }
 
+/** A model cache that cannot fail a load, and reports which copy it served. */
+export type SafeModelCache = ModelCache & {
+  delete(request: RequestInfo | URL): Promise<boolean>
+  /** Whether the key is cached, without recording the read as a load's. */
+  has(request: RequestInfo | URL): Promise<boolean>
+  /** The current copy of the key. Every eviction starts a new copy. */
+  copy(request: RequestInfo | URL): number
+  /**
+   * The copy that the latest `match` of the key returned. After a miss it is
+   * the current copy, because the download that follows is written after
+   * every eviction so far. Transformers.js lets only one load read a file at
+   * a time, and reports the file's `download` event before any other load
+   * can read it, so a load that asks at that event gets the copy it read.
+   */
+  copyLastRead(request: RequestInfo | URL): number
+}
+
 /** How long a write waits behind an eviction before it is dropped. */
 const EVICTION_WAIT_MS = 30_000
 
@@ -225,7 +242,9 @@ async function settlesWithin(
  *
  * Eviction reads the key as a miss until its delete finishes, so a load that
  * starts meanwhile cannot read the rejected file. A read that was already in
- * flight when the eviction began also returns a miss. A model can also be rejected
+ * flight when the eviction began also returns a miss. Each eviction starts a
+ * new copy of the key, and the cache remembers which copy each read returned,
+ * so a load that fails can tell whether the file it read is still cached. A model can also be rejected
  * before its own background write lands, so eviction also waits for every
  * write already in flight to settle and then deletes again: a late write
  * cannot restore the evicted file. A write that starts during an eviction is
@@ -237,7 +256,7 @@ export function createSafeCache(
   open: () => Promise<ModelCache | undefined>,
   expectedBytes: (url: string) => number | undefined = () => undefined,
   evictionWaitMs = EVICTION_WAIT_MS,
-): ModelCache & { delete(request: RequestInfo | URL): Promise<boolean> } {
+): SafeModelCache {
   let opened: Promise<ModelCache | undefined> | undefined
   const cache = () => {
     opened ??= open().catch(() => undefined)
@@ -245,7 +264,11 @@ export function createSafeCache(
   }
   const writes = new Map<string, Set<Promise<void>>>()
   const evicting = new Map<string, Promise<unknown>>()
-  const evictions = new Map<string, number>()
+  // Each eviction starts a new copy of its key.
+  const copies = new Map<string, number>()
+  const copyOf = (key: string) => copies.get(key) ?? 0
+  // The copy that the latest recorded read of each key returned.
+  const hits = new Map<string, number>()
   const remove = async (input: RequestInfo | URL) => {
     try {
       return Boolean(await (await cache())?.delete?.(input))
@@ -255,7 +278,7 @@ export function createSafeCache(
   }
   const evict = (input: RequestInfo | URL) => {
     const key = keyOf(input)
-    evictions.set(key, (evictions.get(key) ?? 0) + 1)
+    copies.set(key, copyOf(key) + 1)
     const removed = remove(input)
     const pending = writes.get(key)
     const settled = Promise.all([
@@ -272,30 +295,49 @@ export function createSafeCache(
     return removed
   }
 
+  /** Returns the cached response with the copy it belongs to, if any. */
+  const read = async (input: RequestInfo | URL) => {
+    const key = keyOf(input)
+    if (evicting.has(key)) return undefined
+    const copy = copyOf(key)
+    let response: Response | undefined
+    try {
+      response = (await (await cache())?.match(input)) ?? undefined
+    } catch {
+      return undefined
+    }
+    // An eviction that started during the read may have deleted this file.
+    if (!response || copyOf(key) !== copy) return undefined
+    const expected = expectedBytes(key)
+    const length = response.headers.get('content-length')
+    if (
+      expected !== undefined &&
+      length !== null &&
+      Number(length) !== expected
+    ) {
+      await evict(input)
+      return undefined
+    }
+    return { response, copy }
+  }
+
   return {
     async match(input) {
       const key = keyOf(input)
-      if (evicting.has(key)) return undefined
-      const generation = evictions.get(key)
-      let response: Response | undefined
-      try {
-        response = (await (await cache())?.match(input)) ?? undefined
-      } catch {
-        return undefined
-      }
-      // An eviction that started during the read may have deleted this file.
-      if (!response || evictions.get(key) !== generation) return undefined
-      const expected = expectedBytes(key)
-      const length = response.headers.get('content-length')
-      if (
-        expected !== undefined &&
-        length !== null &&
-        Number(length) !== expected
-      ) {
-        await evict(input)
-        return undefined
-      }
-      return response
+      const hit = await read(input)
+      if (hit) hits.set(key, hit.copy)
+      else hits.delete(key)
+      return hit?.response
+    },
+    async has(input) {
+      return Boolean(await read(input))
+    },
+    copy(input) {
+      return copyOf(keyOf(input))
+    },
+    copyLastRead(input) {
+      const key = keyOf(input)
+      return hits.get(key) ?? copyOf(key)
     },
     async put(input, response) {
       const key = keyOf(input)

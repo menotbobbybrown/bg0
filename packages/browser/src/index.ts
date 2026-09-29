@@ -4,6 +4,7 @@ import {
   createSafeCache,
   isIndexedDbAvailable,
   type ModelCache,
+  type SafeModelCache,
 } from './cache'
 import {
   createLoadWatch,
@@ -147,7 +148,11 @@ const MODEL_CACHE_NAME = 'transformers-cache'
 const engineLoads = new Map<string, EngineLoad>()
 const failedEngines = new Set<string>()
 // A damaged cached model is evicted once, however many loads read it.
-const corruptModels = createFailureEvictions(evictCachedModel, modelUrl)
+const corruptModels = createFailureEvictions(
+  evictCachedModel,
+  modelUrl,
+  (model) => getModelCache()?.copy(modelUrl(model)) ?? 0,
+)
 let detectedChoices: Promise<EngineChoice[]> | undefined
 let webgpuUsableForSession = true
 
@@ -547,10 +552,10 @@ function expectedModelBytes(url: string): number | undefined {
   return undefined
 }
 
-let modelCache: ReturnType<typeof createSafeCache> | undefined
+let modelCache: SafeModelCache | undefined
 
 /** The cache transformers.js reads and writes, wrapped so it cannot fail a load. */
-function getModelCache(): ReturnType<typeof createSafeCache> | undefined {
+function getModelCache(): SafeModelCache | undefined {
   if (modelCache) return modelCache
   // The Cache API only exists in secure contexts. Fall back to IndexedDB so
   // the model is still cached on plain-http previews and older browsers.
@@ -582,7 +587,7 @@ async function evictCachedModel(model: ModelDefinition): Promise<void> {
 
 async function isModelCached(model: ModelDefinition): Promise<boolean> {
   try {
-    return Boolean(await getModelCache()?.match(modelUrl(model)))
+    return Boolean(await getModelCache()?.has(modelUrl(model)))
   } catch {
     // A blocked cache should not prevent local inference.
     return false
@@ -652,7 +657,9 @@ async function getEngine(
         }
       },
       () => {
-        currentLoad.copy ??= corruptModels.begin(choice.definition)
+        currentLoad.copy ??= getModelCache()?.copyLastRead(
+          modelUrl(choice.definition),
+        )
       },
     )
     currentLoad = { promise, listeners, users: 0, retired: false }
@@ -978,8 +985,8 @@ async function loadEngine(
   )
   const trackedProgress = (event: unknown) => {
     watch.touch()
-    // Transformers.js reports `download` as soon as it has chosen between the
-    // cache and the network, before any other load can evict what it chose.
+    // Transformers.js reports `download` once it has chosen between the cache
+    // and the network, before any other load can read the file.
     if (isModelFileOpened(event, definition)) onModelFileOpened()
     progressCallback(event)
   }

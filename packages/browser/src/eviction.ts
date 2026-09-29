@@ -1,31 +1,28 @@
 /**
  * Evict a damaged cached file once per copy that failed.
  *
- * Every load records which copy of its file it read by calling `begin` when
- * it opens that file. Loads of one file on different providers, and every
- * caller that shared a load, may all fail on the same damaged copy. The first
- * failure evicts it; the rest share that eviction instead of evicting again,
- * because by then a retry may be writing a fresh download and a second
- * eviction would delete it. A load that opened its file after the eviction
- * read a newer copy, so its failure evicts again. A failure without a
- * recorded copy always evicts.
+ * `copyOf` reports which copy of a file is current. `evict` must change it
+ * before returning its promise. Every load records which copy it read. Loads of one file on
+ * different providers, and every caller that shared a load, may all fail on
+ * the same damaged copy. The first failure evicts it; the rest share that
+ * eviction instead of evicting again, because by then a retry may be writing
+ * a fresh download and a second eviction would delete it. A load that read
+ * the current copy evicts it, even after earlier evictions. A failure without
+ * a recorded copy always evicts.
  */
 export function createFailureEvictions<T>(
   evict: (target: T) => Promise<void>,
   keyOf: (target: T) => string,
+  copyOf: (target: T) => number,
 ) {
-  const copies = new Map<string, number>()
   const evictions = new Map<string, Promise<void>>()
   return {
-    begin(target: T): number {
-      return copies.get(keyOf(target)) ?? 0
-    },
     fail(target: T, copy: number | undefined): Promise<void> {
       const key = keyOf(target)
-      const current = copies.get(key) ?? 0
-      const earlier = evictions.get(key)
-      if (copy !== undefined && copy !== current && earlier) return earlier
-      copies.set(key, current + 1)
+      if (copy !== undefined && copy !== copyOf(target)) {
+        // The copy this load read has already been evicted.
+        return evictions.get(key) ?? Promise.resolve()
+      }
       const evicted = evict(target)
       evictions.set(key, evicted)
       return evicted
