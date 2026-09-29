@@ -106,7 +106,7 @@ describe('interrupted run marker', () => {
     })
   })
 
-  test('a run whose lock is held in another tab is not reported or removed', async () => {
+  test('a copied marker whose run is live in another tab is dropped unreported', async () => {
     const { locks, held } = fakeLocks()
     const original = memoryStorage()
     const run = startRunMarker(original, 8000, locks)
@@ -118,8 +118,13 @@ describe('interrupted run marker', () => {
     const copy = memoryStorage()
     copy.setItem(RUN_MARKER_KEY, raw)
     expect(await takeInterruptedRun(copy, 9000, locks)).toBeUndefined()
-    expect(copy.getItem(RUN_MARKER_KEY)).toBe(raw)
+    // The original clears only its own storage, so a kept copy would be
+    // reported as interrupted when this tab later reloads.
+    expect(copy.getItem(RUN_MARKER_KEY)).toBeNull()
+    expect(original.getItem(RUN_MARKER_KEY)).toBe(raw)
     run.clear()
+    await settle()
+    expect(await takeInterruptedRun(copy, 60_000, locks)).toBeUndefined()
     await settle()
     expect(held.size).toBe(0)
     expect(original.getItem(RUN_MARKER_KEY)).toBeNull()
@@ -190,6 +195,19 @@ describe('interrupted run marker', () => {
       provider: 'wasm',
     })
     next.clear()
+  })
+
+  test('a fallback engine load forgets the provider that failed', async () => {
+    const storage = memoryStorage()
+    const run = startRunMarker(storage, 6000)
+    run.update('processing', 'webgpu')
+    // The package reports loading the fallback engine without a provider.
+    run.update('preparing')
+    expect(await takeInterruptedRun(storage, 6000)).toEqual({
+      stage: 'preparing',
+      provider: 'unknown',
+    })
+    run.clear()
   })
 
   test.each([

@@ -251,10 +251,14 @@ export function removeIosBackground(
       notify('finishing', 0.92, 'Finishing edges…')
       // Bounded original for Compare: don't decode the original camera photo again in the UI.
       // Both encoders draw the bitmap before awaiting, so closing it after an
-      // abort is safe. Each releases its own canvases when it settles.
-      const sourceBlob = await unlessAborted(imageToPng(bitmap), options.signal)
+      // abort is safe. Each releases its own canvases when it settles, and an
+      // abort settles it even if toBlob never calls back.
+      const sourceBlob = await unlessAborted(
+        imageToPng(bitmap, options.signal),
+        options.signal,
+      )
       const blob = await unlessAborted(
-        maskToPng(bitmap, alpha, 512, 512, quality, refinement),
+        maskToPng(bitmap, alpha, 512, 512, quality, refinement, options.signal),
         options.signal,
       )
       cancelled(options.signal)

@@ -508,6 +508,7 @@ export async function maskToPng(
   maskHeight: number,
   quality: 'fast' | 'quality',
   refinement?: MaskRefinement,
+  signal?: AbortSignal,
 ): Promise<Blob> {
   const canvases: HTMLCanvasElement[] = []
   try {
@@ -542,14 +543,18 @@ export async function maskToPng(
     // colors with the mask alpha, without a second full-resolution canvas.
     context.globalCompositeOperation = 'source-in'
     context.drawImage(image, 0, 0)
-    // toBlob is asynchronous: keep pixels alive until encoding has settled.
-    return await canvasToPng(output)
+    // toBlob is asynchronous: keep pixels alive until encoding has settled,
+    // unless the caller aborts and no longer wants the result.
+    return await canvasToPng(output, signal)
   } finally {
     for (const canvas of canvases) releaseCanvas(canvas)
   }
 }
 
-export async function imageToPng(image: ImageBitmap): Promise<Blob> {
+export async function imageToPng(
+  image: ImageBitmap,
+  signal?: AbortSignal,
+): Promise<Blob> {
   const canvas = document.createElement('canvas')
   try {
     canvas.width = image.width
@@ -557,7 +562,7 @@ export async function imageToPng(image: ImageBitmap): Promise<Blob> {
     const context = canvas.getContext('2d')
     if (!context) throw new Error('Canvas is unavailable')
     context.drawImage(image, 0, 0)
-    return await canvasToPng(canvas)
+    return await canvasToPng(canvas, signal)
   } finally {
     releaseCanvas(canvas)
   }
@@ -568,12 +573,21 @@ function releaseCanvas(canvas: HTMLCanvasElement): void {
   canvas.height = 0
 }
 
-function canvasToPng(canvas: HTMLCanvasElement): Promise<Blob> {
+// An abort settles the export at once, so the caller's cleanup frees the
+// canvas even if the browser never calls back.
+function canvasToPng(
+  canvas: HTMLCanvasElement,
+  signal?: AbortSignal,
+): Promise<Blob> {
   return new Promise((resolve, reject) => {
-    canvas.toBlob(
-      (blob) => (blob ? resolve(blob) : reject(new Error('PNG export failed'))),
-      'image/png',
-    )
+    const abort = () => reject(new Error('PNG export cancelled'))
+    if (signal?.aborted) return abort()
+    signal?.addEventListener('abort', abort, { once: true })
+    canvas.toBlob((blob) => {
+      signal?.removeEventListener('abort', abort)
+      if (blob) resolve(blob)
+      else reject(new Error('PNG export failed'))
+    }, 'image/png')
   })
 }
 

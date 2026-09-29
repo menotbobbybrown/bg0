@@ -20,7 +20,7 @@ export const Route = createFileRoute('/privacy')({
 
 function Privacy() {
   return (
-    <LegalPage title="Privacy" updated="September 25, 2026">
+    <LegalPage title="Privacy" updated="September 29, 2026">
       <p>
         BG0 removes image backgrounds on your own device. This page explains
         exactly what leaves your browser when you use bg0.dev, which is very
@@ -50,7 +50,9 @@ function Privacy() {
         analytics. We record page routes and a small set of actions: choosing an
         image, whether local removal succeeded, the browser engine used, roughly
         how long removal took (such as "5-15s"), downloading or copying a
-        result, and using result views. We never send image contents or image
+        result, and using result views. If the page reloads during a removal,
+        usually because the browser ran out of memory, the next visit reports
+        only the step it reached and the browser engine. We never send image contents or image
         metadata to PostHog. Session recording, advertising, fingerprinting, and
         automatic click capture are disabled.
       </p>
@@ -72,7 +74,10 @@ function Privacy() {
       <p>
         PostHog stores a random anonymous identifier in local storage so visits
         can be counted without an account. The model cache also uses browser
-        storage and only holds model files.
+        storage and only holds model files. While a removal runs, the tab keeps
+        a small note in session storage with the step, the browser engine, the
+        start time, and a random ID, so it can explain a reload. It is deleted
+        when the removal ends or you leave the page.
       </p>
       <h2>Changes</h2>
       <p>

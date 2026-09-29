@@ -751,6 +751,54 @@ describe('PNG canvas ownership', () => {
       }
     })
   }
+
+  test('an abort releases buffers when toBlob never calls back', async () => {
+    const originalDocument = globalThis.document
+    const canvases: FakeCanvas[] = []
+    Object.defineProperty(globalThis, 'document', {
+      configurable: true,
+      value: {
+        createElement: () => {
+          const canvas = new FakeCanvas()
+          canvas.toBlob = () => {}
+          canvases.push(canvas)
+          return canvas
+        },
+      },
+    })
+    try {
+      for (const exportImage of [
+        (image: ImageBitmap, signal: AbortSignal) => imageToPng(image, signal),
+        (image: ImageBitmap, signal: AbortSignal) =>
+          maskToPng(
+            image,
+            new Float32Array([1]),
+            1,
+            1,
+            'fast',
+            undefined,
+            signal,
+          ),
+      ]) {
+        const controller = new AbortController()
+        const pending = exportImage(
+          { width: 4000, height: 3000 } as ImageBitmap,
+          controller.signal,
+        )
+        expect(canvases.at(-1)?.width).toBe(4000)
+        controller.abort()
+        await expect(pending).rejects.toBeInstanceOf(Error)
+        expect(
+          canvases.every((canvas) => canvas.width === 0 && canvas.height === 0),
+        ).toBe(true)
+      }
+    } finally {
+      Object.defineProperty(globalThis, 'document', {
+        configurable: true,
+        value: originalDocument,
+      })
+    }
+  })
 })
 
 class FakeCanvas {

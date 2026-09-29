@@ -8,7 +8,8 @@ import type { RemovalProgress } from '@bg0/browser'
 // duplicated tabs, so a marker alone can belong to a run that is still going
 // in another tab. Each run therefore holds a Web Lock named after the marker's
 // random id. Locks are released when a page dies, so a marker whose lock is
-// still held belongs to a live run and is left alone.
+// still held belongs to a live run in another tab. That tab clears only its
+// own copy, so this tab drops the copied marker without reporting it.
 //
 // Privacy: the marker holds only the stage, the provider, the start time, and
 // a random id. Never add image data, filenames, dimensions, or URLs.
@@ -142,7 +143,12 @@ export function startRunMarker(
   write(storage, { stage, provider, startedAt, id })
   const owned = () => read(storage)?.id === id
   return {
-    update(next, nextProvider = provider) {
+    update(next, reported) {
+      // Loading without a provider means the engine is being chosen again,
+      // for example after a WebGPU failure, so the old one no longer applies.
+      const nextProvider =
+        reported ??
+        (next === 'preparing' || next === 'downloading' ? 'unknown' : provider)
       if (!active || (next === stage && nextProvider === provider)) return
       stage = next
       provider = nextProvider
@@ -183,9 +189,9 @@ async function runIsAlive(locks: RunLocks | undefined, id: string | undefined) {
 
 /**
  * Return and remove a marker left by a page that died mid-run. Call this once
- * when the remover mounts. A marker whose run still holds its lock in another
- * tab is kept and not reported. Missing or stale markers are dropped before
- * the returned promise first yields.
+ * when the remover mounts. A marker copied from a run that still holds its
+ * lock in another tab is dropped without being reported. Missing or stale
+ * markers are dropped before the returned promise first yields.
  */
 export async function takeInterruptedRun(
   storage = sessionStore(),
@@ -198,11 +204,12 @@ export async function takeInterruptedRun(
     clearRunMarker(storage)
     return undefined
   }
-  if (await runIsAlive(locks, marker.id)) return undefined
+  const alive = await runIsAlive(locks, marker.id)
   // A new run in this tab, or another call, may have replaced or taken the
   // marker while the lock query was pending.
   if (!sameMarker(read(storage), marker)) return undefined
   clearRunMarker(storage)
+  if (alive) return undefined
   return { stage: marker.stage, provider: marker.provider }
 }
 

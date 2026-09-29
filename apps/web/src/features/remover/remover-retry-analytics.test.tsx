@@ -323,7 +323,7 @@ describe('Remover interrupted runs', () => {
     expect(interruptedCalls).toHaveLength(1)
   })
 
-  test('a run still holding its lock in another tab is not reported', async () => {
+  test('a copied marker whose run is live in another tab is dropped unreported', async () => {
     const raw = JSON.stringify({
       stage: 'processing',
       provider: 'wasm',
@@ -354,19 +354,16 @@ describe('Remover interrupted runs', () => {
       await new Promise((resolve) => setTimeout(resolve, 10))
       expect(interruptedCalls).toEqual([])
       expect(view.queryByText(/ran out of memory/)).toBeNull()
-      expect(sessionStorage.getItem(KEY)).toBe(raw)
+      // The other tab clears only its own copy, so this one drops it.
+      expect(sessionStorage.getItem(KEY)).toBeNull()
       view.unmount()
 
-      // Once that tab dies, its lock is gone and the marker is reported.
+      // Its finished run is not reported when this tab loads again.
       held = []
       const again = render(<Remover waitForPaintImpl={async () => {}} />)
-      await waitFor(() =>
-        expect(interruptedCalls).toEqual([['processing', 'wasm']]),
-      )
-      expect(again.getByRole('status').textContent).toContain(
-        'the browser ran out of memory',
-      )
-      expect(readMarker()).toBeNull()
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      expect(interruptedCalls).toEqual([])
+      expect(again.queryByText(/ran out of memory/)).toBeNull()
       again.unmount()
     } finally {
       if (original) Object.defineProperty(navigator, 'locks', original)

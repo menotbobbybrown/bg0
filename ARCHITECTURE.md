@@ -133,14 +133,15 @@ When Safari exceeds that budget it kills the page and reloads it, so no failure
 event can be sent. The remover keeps a sessionStorage marker during each run
 that holds only the stage, the provider, the start time, and a random run id.
 The provider is `unknown` until `@bg0/browser` reports the one it chose in a
-progress event. Browsers copy sessionStorage into duplicated tabs and tabs
+progress event, and goes back to `unknown` when a fallback engine starts
+loading. Browsers copy sessionStorage into duplicated tabs and tabs
 opened from this one, so each run also holds a Web Lock named after its id
 until the marker clears. A page that dies releases its locks. A marker found on
 the next load within 10 minutes produces one anonymous
 `background_removal_interrupted` event with only `stage` and `provider`, and an
 explanation for the user. Success, failure, cancel, reset, unmount, and
-`pagehide` clear it. A marker whose lock another tab still holds is left in
-place and not reported. Without the Web Locks API every fresh marker is
+`pagehide` clear it. A marker whose lock another tab still holds is a copy of
+that tab's live run, so it is removed from this tab and not reported. Without the Web Locks API every fresh marker is
 reported, as before. A run with no progress for 5 minutes on any platform
 becomes a retryable error.
 
