@@ -16,14 +16,18 @@ async function downloadModel(response) {
   const reader = response.body.getReader();
   let offset = 0;
   let reported = 0;
+  let reportedAt = Date.now();
   for (;;) {
     const {done, value} = await reader.read();
     if (done) break;
     if (offset + value.byteLength > MODEL_BYTES) throw new Error('Unexpected model size');
     bytes.set(value, offset);
     offset += value.byteLength;
-    if (offset - reported >= MODEL_BYTES / 50) {
+    // Report every 2% or every few seconds, so a slow but moving download
+    // never looks hung to the page's watchdog.
+    if (offset - reported >= MODEL_BYTES / 50 || Date.now() - reportedAt >= 5000) {
       reported = offset;
+      reportedAt = Date.now();
       self.postMessage({stage:'loading', progress: offset / MODEL_BYTES});
     }
   }

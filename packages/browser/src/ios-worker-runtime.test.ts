@@ -75,6 +75,7 @@ const MODEL_BYTES = 55563408
 function loadWorker(
   body: Uint8Array[] | undefined,
   create: () => Promise<object> = async () => ({}),
+  now?: () => number,
 ) {
   const messages: {
     id?: number
@@ -91,6 +92,7 @@ function loadWorker(
     postMessage: (data: (typeof messages)[number]) => messages.push(data),
   }
   runInNewContext(source, {
+    ...(now ? { Date: { now } } : {}),
     URL,
     Uint8Array,
     RangeError,
@@ -148,6 +150,22 @@ test('worker streams the model into one exact buffer and reports progress', asyn
     .map((m) => m.progress)
   expect(progress).toEqual([0.25, 0.5, 0.75, 1])
   expect(worker.messages.at(-1)).toEqual({ id: 1, ready: true })
+})
+
+test('a slow download still reports every few seconds', async () => {
+  // Chunks far below the 2% step, arriving 6 seconds apart.
+  const small = new Uint8Array(1024)
+  const rest = new Uint8Array(MODEL_BYTES - 3 * 1024)
+  let clock = 0
+  const worker = loadWorker([small, small, small, rest], undefined, () => {
+    clock += 6000
+    return clock
+  })
+  await worker.load()
+  const progress = worker.messages.filter(
+    (m) => m.stage === 'loading' && m.progress !== undefined,
+  )
+  expect(progress.length).toBe(4)
 })
 
 test.each([

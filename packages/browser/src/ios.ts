@@ -153,6 +153,7 @@ export function removeIosBackground(
       options.signal?.addEventListener('abort', abort, { once: true })
       const format = await unlessAborted(validateImage(input), options.signal)
       notify('preparing', 0.03, 'Preparing image…')
+      cancelled(options.signal)
       // Decode once. Keep only the 512px model input and a copy bounded to the
       // output size; the full-resolution bitmap is closed before model load.
       const prepared = await unlessAborted(

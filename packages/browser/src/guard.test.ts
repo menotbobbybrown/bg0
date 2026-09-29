@@ -12,6 +12,23 @@ const descriptors = ['localStorage', 'sessionStorage', 'window'].map(
 const local = new Map<string, string>()
 const session = new Map<string, string>()
 
+function fakeLocks() {
+  const held = new Set<string>()
+  return {
+    held,
+    locks: {
+      request: (name: string, callback: () => Promise<void>) => {
+        held.add(name)
+        return callback().finally(() => held.delete(name))
+      },
+      query: async () => ({
+        held: [...held].map((name) => ({ name })),
+        pending: [],
+      }),
+    } as unknown as Pick<LockManager, 'request' | 'query'>,
+  }
+}
+
 function storage(map: Map<string, string>) {
   return {
     getItem: (key: string) => map.get(key) ?? null,
@@ -42,7 +59,7 @@ afterEach(() => {
 })
 
 describe('full model guard', () => {
-  test('clears the running marker when work settles', () => {
+  test('clears the running marker when work settles', async () => {
     const settleLoad = markFullModelRunning()
     const settleRun = markFullModelRunning()
     expect(session.size).toBe(1)
@@ -51,19 +68,19 @@ describe('full model guard', () => {
     settleRun()
     settleRun()
     expect(session.size).toBe(0)
-    expect(isFullModelBlocked()).toBe(false)
+    expect(await isFullModelBlocked()).toBe(false)
   })
 
-  test('a marker left by a killed tab blocks the full model', () => {
+  test('a marker left by a killed tab blocks the full model', async () => {
     session.set('bg0:full-model-running:v1', '1')
-    expect(isFullModelBlocked(1000)).toBe(true)
+    expect(await isFullModelBlocked(1000)).toBe(true)
     expect(session.size).toBe(0)
-    expect(isFullModelBlocked(2000)).toBe(true)
+    expect(await isFullModelBlocked(2000)).toBe(true)
   })
 
-  test('does not treat work still running in this page as a crash', () => {
+  test('does not treat work still running in this page as a crash', async () => {
     const settle = markFullModelRunning()
-    expect(isFullModelBlocked()).toBe(false)
+    expect(await isFullModelBlocked()).toBe(false)
     settle()
   })
 
@@ -88,20 +105,44 @@ describe('full model guard', () => {
     expect(session.size).toBe(0)
   })
 
-  test('a block lasts a week', () => {
+  test('a block lasts a week', async () => {
     const week = 7 * 24 * 60 * 60 * 1000
     blockFullModel(0)
-    expect(isFullModelBlocked(week - 1)).toBe(true)
-    expect(isFullModelBlocked(week)).toBe(false)
+    expect(await isFullModelBlocked(week - 1)).toBe(true)
+    expect(await isFullModelBlocked(week)).toBe(false)
     expect(local.size).toBe(0)
   })
 
-  test('works without storage', () => {
+  test('works without storage', async () => {
     Reflect.deleteProperty(globalThis, 'localStorage')
     Reflect.deleteProperty(globalThis, 'sessionStorage')
     const settle = markFullModelRunning()
     blockFullModel()
-    expect(isFullModelBlocked()).toBe(false)
+    expect(await isFullModelBlocked()).toBe(false)
     settle()
+  })
+
+  test('a marker copied from a tab that is still working is not a crash', async () => {
+    const { held, locks } = fakeLocks()
+    const settle = markFullModelRunning(locks)
+    const marker = session.get('bg0:full-model-running:v1')
+    expect(marker).toBeTruthy()
+    expect(held.size).toBe(1)
+    settle()
+    await Promise.resolve()
+    expect(held.size).toBe(0)
+
+    // A duplicated tab starts with the original's marker while the original
+    // still holds the lock for it.
+    held.add(`bg0:full-model-running:v1:${marker}`)
+    session.set('bg0:full-model-running:v1', String(marker))
+    expect(await isFullModelBlocked(1000, locks)).toBe(false)
+    expect(session.size).toBe(0)
+    expect(local.size).toBe(0)
+
+    // The same marker with nobody holding its lock was left by a crash.
+    held.clear()
+    session.set('bg0:full-model-running:v1', String(marker))
+    expect(await isFullModelBlocked(1000, locks)).toBe(true)
   })
 })

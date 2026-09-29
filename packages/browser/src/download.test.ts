@@ -294,6 +294,25 @@ describe('model download watchdog', () => {
     expect(watch.downloadFailure).toBeUndefined()
   })
 
+  test('disposing a failed load aborts requests still in flight', async () => {
+    const { timers } = fakeTimers()
+    let seen: AbortSignal | undefined
+    const watch = createLoadWatch(
+      (_input, init) => {
+        seen = init?.signal ?? undefined
+        return new Promise<Response>(() => undefined)
+      },
+      { stallMs: 1000, startMs: 5000, timers },
+    )
+    void watch.fetch('https://example.test/model.onnx').catch(() => undefined)
+    await Promise.resolve()
+    expect(seen?.aborted).toBe(false)
+    const reason = new Error('processor failed')
+    watch.dispose(reason)
+    expect(watch.signal.aborted).toBe(true)
+    expect(seen?.aborted).toBe(true)
+  })
+
   test('dispose stops the watchdog', async () => {
     const { timers, advance, pending } = fakeTimers()
     const watch = createLoadWatch(async () => streamResponse([]), {

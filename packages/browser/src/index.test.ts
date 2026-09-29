@@ -726,6 +726,7 @@ describe('model load recovery', () => {
 
   test('a model that never finishes starting stops the walk and skips the full model next time', async () => {
     modelLoadTimings.startMs = 20
+    let finish: (value: never) => void = () => undefined
     const load = spyOn(AutoModel, 'from_pretrained').mockImplementation(
       async (id, options) => {
         if (id !== FULL_MODEL.id) return model('logits') as never
@@ -734,7 +735,9 @@ describe('model load recovery', () => {
           name: id,
           file: 'onnx/model_fp16.onnx',
         })
-        return new Promise(() => undefined)
+        return new Promise((resolve) => {
+          finish = resolve
+        })
       },
     )
     await expect(removeBackground(png)).rejects.toMatchObject({
@@ -745,6 +748,44 @@ describe('model load recovery', () => {
     expect(load).toHaveBeenCalledTimes(1)
     expect(storage.has('bg0:full-model-blocked:v1')).toBe(true)
     expect((await removeBackground(png)).model).toBe('birefnet-lite')
+    // Let the abandoned load end so its crash marker is released.
+    finish(model('logits') as never)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  })
+
+  test('a timed-out full model keeps its crash marker until the load really stops', async () => {
+    modelLoadTimings.startMs = 20
+    const session = new Map<string, string>()
+    Object.defineProperty(globalThis, 'sessionStorage', {
+      configurable: true,
+      value: {
+        getItem: (key: string) => session.get(key) ?? null,
+        setItem: (key: string, value: string) => session.set(key, value),
+        removeItem: (key: string) => session.delete(key),
+      },
+    })
+    let finish: (value: never) => void = () => undefined
+    spyOn(AutoModel, 'from_pretrained').mockImplementation(
+      async (id, options) => {
+        if (id !== FULL_MODEL.id) return model('logits') as never
+        options?.progress_callback?.({
+          status: 'done',
+          name: id,
+          file: 'onnx/model_fp16.onnx',
+        })
+        return new Promise((resolve) => {
+          finish = resolve
+        })
+      },
+    )
+    await expect(removeBackground(png)).rejects.toMatchObject({
+      code: 'model-load-failed',
+    })
+    // Session creation is still running, and it can still kill the tab.
+    expect(session.has('bg0:full-model-running:v1')).toBe(true)
+    finish(model('logits') as never)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(session.has('bg0:full-model-running:v1')).toBe(false)
   })
 
   test('a tab that died during full-model work uses the lite model after reload', async () => {
